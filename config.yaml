@@ -1,0 +1,25 @@
+# config.yaml — 默认仿真配置（100 agent，50 步）
+# 用法：python3 run_sim.py
+#       python3 run_sim.py --config config.yaml
+
+n_agents: 100
+agent_type_ratio:
+  PUBLIC:         0.70   # 70 个普通网民
+  OPINION_LEADER: 0.10   # 10 个意见领袖
+  MEDIA:          0.10   # 10 个媒体
+  OFFICIAL:       0.10   # 10 个官方
+
+network_type: "barabasi_albert"   # 无标度网络（幂律分布，类似真实社交网络）
+network_params:
+  m: 3                             # 每个新节点连接 m 条边
+
+n_steps: 50
+
+hawkes_params:
+  mu:    0.1    # 基线强度
+  alpha: 0.5    # 激励系数
+  beta:  1.0    # 衰减系数
+
+llm_config: {}   # S1 阶段不使用 LLM，留空
+
+random_seed: 42

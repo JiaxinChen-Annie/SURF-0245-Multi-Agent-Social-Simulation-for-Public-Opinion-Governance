@@ -1,0 +1,24 @@
+# config_single.yaml — 单节点冒烟测试
+# 目的：验证 __init__ / _build_social_network / _place_agents / step() 流程能跑通
+# 不涉及邻居感知和观点扩散，纯骨架验证
+
+n_agents: 1
+agent_type_ratio:
+  PUBLIC:         1.0
+  OPINION_LEADER: 0.0
+  MEDIA:          0.0
+  OFFICIAL:       0.0
+
+network_type: "barabasi_albert"
+network_params:
+  m: 3            # n=1 时会自动退化为单节点图
+
+n_steps: 5        # 跑5步即可，验证循环不崩
+
+hawkes_params:
+  mu:    0.5      # 基线调高，确保单节点能被激活
+  alpha: 0.3
+  beta:  1.0
+
+llm_config: {}
+random_seed: 42

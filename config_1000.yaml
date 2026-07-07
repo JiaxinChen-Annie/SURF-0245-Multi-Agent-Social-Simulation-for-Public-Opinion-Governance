@@ -1,0 +1,25 @@
+# config_1000.yaml — 压力测试配置（1000 agent，50 步）
+# 用途：验收标准 50步×1000Agent < 30秒
+# 用法：python3 run_sim.py --config config_1000.yaml --no-plot
+
+n_agents: 1000
+agent_type_ratio:
+  PUBLIC:         0.70
+  OPINION_LEADER: 0.10
+  MEDIA:          0.10
+  OFFICIAL:       0.10
+
+network_type: "barabasi_albert"
+network_params:
+  m: 3
+
+n_steps: 50
+
+hawkes_params:
+  mu:    0.1
+  alpha: 0.5
+  beta:  1.0
+
+llm_config: {}
+
+random_seed: 42

@@ -1,0 +1,11 @@
+﻿文件名,归属,作用说明
+opinion_model.py,A 独有，冻结,函数 11-18 + submit_action 全量实现，不允许其他人改动
+mesa_compat.py,A 维护,Mesa 未安装时的兼容层；装好 pip install mesa 之后可以直接删除
+types_def.py,A 主导，全组冻结,定义全部的数据类型，任何人修改都需要全组同意
+social_agent.py,A 提供存根 → B 认领替换,函数 1-10，B 只需要替换 _update_beliefs 这一个方法体即可
+hawkes_engine.py,A 提供存根 → C 认领替换,函数 19-22，C 只替换函数体，类名和对外的接口签名保持不变
+run_sim.py,A 维护,仿真程序主入口，自带全套测验收敛逻辑
+test_contract.py,A 维护，跨组唯一标准,B/C 替换完文件之后，必须跑通这个脚本才算交付验收
+config.yaml,A,默认配置：100 个 Agent，运行 50 步
+config_single.yaml,A,单节点冒烟测试，用来验证整体框架不会崩溃
+config_1000.yaml,A,压力测试：1000 个 Agent，项目最终的验收标准用这个配置
