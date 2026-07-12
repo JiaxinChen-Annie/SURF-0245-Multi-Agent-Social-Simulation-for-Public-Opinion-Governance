@@ -1,0 +1,7 @@
+# 多智能体舆情仿真 — 依赖
+pyyaml>=6.0
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+# 可选: 语义相似度 (compute_similarity 高级模式)
+# sentence-transformers>=2.2
