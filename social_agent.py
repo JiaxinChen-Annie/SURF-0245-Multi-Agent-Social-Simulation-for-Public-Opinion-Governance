@@ -65,7 +65,8 @@ class SocialAgent(Agent):
         agent_type: AgentType,
         init_config: Dict[str, Any],
     ) -> None:
-        super().__init__(unique_id, model)
+        super().__init__(model)
+        self.unique_id = unique_id
 
         # 初始化信念系统
         self.beliefs = BeliefSystem(
