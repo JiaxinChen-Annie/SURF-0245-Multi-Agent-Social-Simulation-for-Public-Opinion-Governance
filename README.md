@@ -1,5 +1,5 @@
 # SURF-0245-Multi-Agent-Social-Simulation-for-Public-Opinion-Governance
-SURF  Project: LLM-powered multi-agent simulation system for social public opinion evolution and official governance strategy evaluation, built on Mesa &amp; Hawkes process.
+SURF Project: LLM-powered multi-agent simulation system for social public opinion evolution and official governance strategy evaluation, built on Mesa &amp; Hawkes process.
 ## System Architecture (5-Module Independent Division for 5-Person Team)
 1. OpinionModel (Module A, Project Lead): System scheduler, social network construction, global time-step loop, real-time public opinion metric collection
 2. SocialAgent (Module B, Core Agent Layer): BDI four-layer belief reasoning, agent perception-memory-inference-action pipeline driven by LLM
