@@ -28,6 +28,7 @@ opinion_model.py — 模型/环境层（接口表 #12–20）
 """
 
 from __future__ import annotations
+import mesa_patch  # Mesa 3.x 兼容补丁
 
 import logging
 import math
@@ -152,7 +153,10 @@ class OpinionModel(Model):
         self._heat_exceeded_tick: Optional[int] = None   # 热度首次超 THETA 的 tick
         self._recovery_time: Optional[int] = None        # 热度回落后记录
 
-        # ⑧ 放置智能体
+        # ⑧ A 模块自维护的 agent 查找字典（绕开 Mesa 3.x AgentSet 不支持索引的问题）
+        self._agent_dict: Dict[int, Any] = {}
+
+        # ⑨ 放置智能体
         self._place_agents()
 
         _LOG.info(
@@ -282,6 +286,7 @@ class OpinionModel(Model):
                 )
                 self.schedule.add(agent)
                 self.grid.place_agent(agent, nodes[agent_id])
+                self._agent_dict[agent_id] = agent  # 自维护查找字典
                 agent_id += 1
 
         dist_str = " | ".join(f"{t.name}:{c}" for t, c in counts.items())
@@ -312,7 +317,7 @@ class OpinionModel(Model):
         mu  = self.config.hawkes_params.get("mu", 0.1)
         activation_rate = float(np.clip(0.30 * lam / max(mu, 1e-9), 0.10, 0.80))
 
-        all_agents = self.schedule.agents
+        all_agents = list(self.schedule.agents)  # Mesa 3.x 兼容
         n_active   = max(1, int(len(all_agents) * activation_rate))
         active_set = self.random.sample(all_agents, k=n_active)
 
@@ -365,7 +370,8 @@ class OpinionModel(Model):
         # ── ① 尝试获取 B 模块的 calc_heat_decay ──────────────────────
         # B 模块将 calc_heat_decay 定义在 SocialAgent 上，
         # A 模块通过取第一个 agent 实例来调用（若存在）。
-        _b_agent = self.schedule.agents[0] if self.schedule.agents else None
+        _agents_list = list(self.schedule.agents)  # Mesa 3.x AgentSet 需转 list 才能索引
+        _b_agent = _agents_list[0] if _agents_list else None
         _has_b_decay = _b_agent is not None and hasattr(_b_agent, "calc_heat_decay")
 
         def _heat_decay(current_heat: float, group_type: GroupType) -> float:
@@ -430,17 +436,21 @@ class OpinionModel(Model):
             self._topic_negative_flat[topic_id] = float(np.mean(neg_vals))
 
         # ── ⑤ 更新 recovery_time 追踪 ─────────────────────────────────
-        avg_heat = float(np.mean([
-            v for gd in self.topic_heat.values() for v in gd.values()
-        ])) if self.topic_heat else 0.0
+        # 按单群判断：任一群热度超阈 → 记录超阈时刻；所有群都回落 → 记录 recovery_time
+        # （用均值会因冷群拉低而永远触发不了，场景上"任一群爆发"才是舆情事件）
+        all_heats = [v for gd in self.topic_heat.values() for v in gd.values()]
+        max_heat  = float(max(all_heats)) if all_heats else 0.0
 
-        if avg_heat >= THETA and self._heat_exceeded_tick is None:
+        if max_heat >= THETA and self._heat_exceeded_tick is None:
             self._heat_exceeded_tick = current_tick
-        elif avg_heat < THETA and self._heat_exceeded_tick is not None:
+            _LOG.info(
+                f"[tick={current_tick}] 热度首次超阈 max_heat={max_heat:.3f} ≥ θ={THETA}"
+            )
+        elif max_heat < THETA and self._heat_exceeded_tick is not None:
             if self._recovery_time is None:
                 self._recovery_time = current_tick - self._heat_exceeded_tick
                 _LOG.info(
-                    f"[tick={current_tick}] 热度回落，recovery_time={self._recovery_time}"
+                    f"[tick={current_tick}] 热度全面回落，recovery_time={self._recovery_time}"
                 )
 
         # ── ⑥ 淘汰过期信息流 ──────────────────────────────────────────
@@ -480,7 +490,7 @@ class OpinionModel(Model):
         第一次调用时无前一快照，返回 0.0。
         范围 [0, 1]。
         """
-        agents = self.schedule.agents
+        agents = list(self.schedule.agents)  # Mesa 3.x 兼容
 
         curr_snap: Dict[int, EmotionState] = {}
         for agent in agents:
@@ -507,6 +517,10 @@ class OpinionModel(Model):
     # ================================================================== #
     #  #20  submit_action（W4 重写）                                        #
     # ================================================================== #
+    def _register_agent(self, agent) -> None:
+        """将 agent 注册到 A 模块自维护的查找字典（Mesa 3.x 兼容）。"""
+        self._agent_dict[agent.unique_id] = agent
+
     def submit_action(self, record: ActionRecord) -> None:
         """
         将智能体行动写入环境信息流缓存，供下一 tick 邻居 _perceive 读取。
@@ -614,7 +628,7 @@ class OpinionModel(Model):
 
     def _calc_negative_emotion(self) -> float:
         """负面情绪指数：valence < 0 的 agent 比例。"""
-        agents = self.schedule.agents
+        agents = list(self.schedule.agents)  # Mesa 3.x
         if not agents:
             return 0.0
         neg_count = sum(
@@ -652,7 +666,7 @@ class OpinionModel(Model):
     def _collect_opinion_values(self) -> List[float]:
         """从所有 Agent 提取对 T001 话题的观点值列表。"""
         vals: List[float] = []
-        for agent in self.schedule.agents:
+        for agent in list(self.schedule.agents):
             if hasattr(agent, "beliefs") and agent.beliefs.opinions:
                 op = agent.beliefs.opinions.get("T001")
                 if op is None:
@@ -661,12 +675,17 @@ class OpinionModel(Model):
         return vals
 
     def _get_agent_by_id(self, agent_id: int):
-        """按 unique_id 查找 Agent；O(1)（依赖调度器内部字典）。"""
-        # RandomActivation 存储在 _agents 字典中
-        if hasattr(self.schedule, "_agents"):
-            return self.schedule._agents.get(agent_id)
-        # 降级：线性扫描
-        for a in self.schedule.agents:
+        """
+        按 unique_id 查找 Agent（O(1)）。
+        使用 A 模块自维护的 _agent_dict，完全绕开 Mesa 2/3.x 内部结构差异。
+        """
+        # 优先用自维护字典（Mesa 2/3 通用）
+        if hasattr(self, '_agent_dict'):
+            agent = self._agent_dict.get(agent_id)
+            if agent is not None:
+                return agent
+        # 降级：线性扫描（兜底，理论上不会走到这里）
+        for a in list(self.schedule.agents):
             if a.unique_id == agent_id:
                 return a
         return None
@@ -674,7 +693,7 @@ class OpinionModel(Model):
     def _get_controller_groups(self) -> set:
         """返回拥有至少一个 CONTROLLER agent 的群类型集合。"""
         groups = set()
-        for agent in self.schedule.agents:
+        for agent in list(self.schedule.agents):
             if (hasattr(agent, "beliefs")
                     and agent.beliefs.identity.agent_type == AgentType.CONTROLLER):
                 groups.add(agent.beliefs.identity.group_type)

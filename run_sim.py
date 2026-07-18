@@ -17,6 +17,7 @@ run_sim.py — 仿真主入口（W4 版本）
 """
 
 from __future__ import annotations
+import mesa_patch  # Mesa 3.x 兼容补丁
 
 import argparse
 import logging
@@ -73,7 +74,7 @@ def load_config(path: str) -> SimConfig:
         n_steps          = raw.get("n_steps",          50),
         hawkes_params    = raw.get("hawkes_params",    {"mu": 0.1, "alpha": 0.5, "beta": 1.0}),
         llm_config       = raw.get("llm_config",       {}),
-        random_seed      = raw.get("random_seed",      42),
+        random_seed      = (raw.get("random_seed") or __import__('random').randint(0, 2**31)),
     )
 
 

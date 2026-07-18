@@ -16,6 +16,7 @@ B 同学 S2 阶段用真实 LLM 版本替换 _update_beliefs 即可。
 """
 
 from __future__ import annotations
+import mesa_patch  # Mesa 3.x 兼容补丁
 
 import logging
 import math
@@ -76,7 +77,12 @@ class SocialAgent(Agent):
         group_type: GroupType,        # v2 新增参数，A 模块必须传入
         init_config: Dict[str, Any],
     ) -> None:
-        super().__init__(unique_id, model)
+        # Mesa 3.x: Agent.__init__(self, model)，unique_id 已移除
+        # Mesa 2.x / mesa_compat: Agent.__init__(self, unique_id, model)
+        try:
+            super().__init__(unique_id, model)
+        except TypeError:
+            super().__init__(model)
         self.unique_id = unique_id
 
         # βₖ（由 group_type 决定，B 模块内部读取 GROUP_BETA）

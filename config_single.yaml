@@ -30,4 +30,4 @@ hawkes_params:
   beta:  1.0
 
 llm_config: {}
-random_seed: 42
+random_seed: null   # null = 每次随机种子
