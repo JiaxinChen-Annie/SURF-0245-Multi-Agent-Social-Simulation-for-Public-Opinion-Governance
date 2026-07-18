@@ -1,13 +1,22 @@
 # config_single.yaml — 单节点冒烟测试
 # 目的：验证 __init__ / _build_social_network / _place_agents / step() 流程能跑通
 # 不涉及邻居感知和观点扩散，纯骨架验证
+#
+# 【v2 变更】agent_type_ratio 键名对齐新 AgentType；新增 group_type_ratio
 
 n_agents: 1
+
 agent_type_ratio:
-  PUBLIC:         1.0
-  OPINION_LEADER: 0.0
-  MEDIA:          0.0
-  OFFICIAL:       0.0
+  ORDINARY:    1.0
+  ACTIVE:      0.0
+  RATIONAL:    0.0
+  CONTROLLER:  0.0
+
+group_type_ratio:
+  DORM:   0.25
+  CLASS:  0.25
+  MAJOR:  0.25
+  CAMPUS: 0.25
 
 network_type: "barabasi_albert"
 network_params:

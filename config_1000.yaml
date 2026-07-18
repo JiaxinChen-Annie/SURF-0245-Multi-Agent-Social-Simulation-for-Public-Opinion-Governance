@@ -1,13 +1,22 @@
 # config_1000.yaml — 压力测试配置（1000 agent，50 步）
 # 用途：验收标准 50步×1000Agent < 30秒
 # 用法：python3 run_sim.py --config config_1000.yaml --no-plot
+#
+# 【v2 变更】agent_type_ratio 键名对齐新 AgentType；新增 group_type_ratio
 
 n_agents: 1000
+
 agent_type_ratio:
-  PUBLIC:         0.70
-  OPINION_LEADER: 0.10
-  MEDIA:          0.10
-  OFFICIAL:       0.10
+  ORDINARY:    0.70
+  ACTIVE:      0.10
+  RATIONAL:    0.10
+  CONTROLLER:  0.10
+
+group_type_ratio:
+  DORM:   0.25
+  CLASS:  0.35
+  MAJOR:  0.25
+  CAMPUS: 0.15
 
 network_type: "barabasi_albert"
 network_params:

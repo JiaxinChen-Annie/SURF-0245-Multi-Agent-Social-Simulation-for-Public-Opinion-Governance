@@ -1,13 +1,25 @@
 # config.yaml — 默认仿真配置（100 agent，50 步）
+# 场景：大学校园多群舆情扩散
 # 用法：python3 run_sim.py
 #       python3 run_sim.py --config config.yaml
+#
+# 【v2 变更】
+#   agent_type_ratio 键名对齐新 AgentType: ORDINARY/ACTIVE/RATIONAL/CONTROLLER
+#   新增 group_type_ratio: DORM/CLASS/MAJOR/CAMPUS
 
 n_agents: 100
+
 agent_type_ratio:
-  PUBLIC:         0.70   # 70 个普通网民
-  OPINION_LEADER: 0.10   # 10 个意见领袖
-  MEDIA:          0.10   # 10 个媒体
-  OFFICIAL:       0.10   # 10 个官方
+  ORDINARY:    0.70   # 70 个普通群员（多数沉默，偶尔附和/提问）
+  ACTIVE:      0.10   # 10 个活跃讨论者（乐于转发、分享信息）
+  RATIONAL:    0.10   # 10 个理性讨论者（质疑信息真实性）
+  CONTROLLER:  0.10   # 10 个管理者（提醒、澄清、禁言、公告）
+
+group_type_ratio:
+  DORM:   0.25   # 宿舍群（管理强度很弱，β₁=0.05）
+  CLASS:  0.35   # 班级群（管理强度中弱，β₂=0.12）
+  MAJOR:  0.25   # 专业群（管理强度中，β₃=0.20）
+  CAMPUS: 0.15   # 校园群（管理强度强，β₄=0.30）
 
 network_type: "barabasi_albert"   # 无标度网络（幂律分布，类似真实社交网络）
 network_params:
@@ -20,6 +32,6 @@ hawkes_params:
   alpha: 0.5    # 激励系数
   beta:  1.0    # 衰减系数
 
-llm_config: {}   # S1 阶段不使用 LLM，留空
+llm_config: {}   # W4 阶段暂不使用 LLM，留空
 
 random_seed: 42

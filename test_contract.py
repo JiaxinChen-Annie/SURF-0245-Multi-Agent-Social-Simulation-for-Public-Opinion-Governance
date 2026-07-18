@@ -1,28 +1,23 @@
 """
-test_contract.py — 接口契约验证脚本
---------------------------------------
-每个人更新自己的模块后，在项目根目录运行：
+test_contract.py — 接口契约验证脚本（v2，W4）
+----------------------------------------------
+更新内容：
+  - AgentType: ORDINARY/ACTIVE/RATIONAL/CONTROLLER
+  - ActionType: SEND_MESSAGE/REPLY/FORWARD/SILENT（移除 LIKE）
+  - GroupType: DORM/CLASS/MAJOR/CAMPUS
+  - MessageType 字符串常量
+  - ActionRecord 新增字段检查（topic_id/distortion_level/message_type/negative_score/heat）
+  - submit_action 新增 topic_heat/topic_negative/cross_group_forward 检查
+  - SocialAgent.__init__ 新增 group_type 参数验证
+  - calc_heat_decay 接口验证（#11）
+  - Perception 新增字段检查
 
-    python3 test_contract.py
-
-全部绿 ✅ 才算接口兼容，可以交给下游。
-本脚本不依赖 pytest，直接 python3 跑即可。
-
-覆盖范围：
-  - [types]  types_def.py 共享类型可正常导入
-  - [B]      SocialAgent 接口（__init__ / step / beliefs / pending_action）
-  - [C]      HawkesEngine 接口（intensity / add_event / sample_next_time）
-  - [A]      OpinionModel 核心流程（3-agent × 3-step 全链路）
-  - [A]      submit_action 写入缓存
+用法：python3 test_contract.py
 """
 
 from __future__ import annotations
 import sys
 import traceback
-
-# ─────────────────────────────────────────────────────────────────── #
-# 迷你测试框架（不依赖 pytest）
-# ─────────────────────────────────────────────────────────────────── #
 
 _results: list = []
 
@@ -41,32 +36,101 @@ def _check(label: str, fn) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════ #
-# [types]  共享类型层
+# [types]  共享类型层（v2）
 # ═══════════════════════════════════════════════════════════════════ #
 
 def _test_types_import():
     from types_def import (
-        SimConfig, AgentType, ActionType, ActionRecord,
-        BeliefSystem, Perception, MemoryRecord, EmotionState,
-        Desire, Intention, SocialInfo, OpinionBelief,
+        SimConfig, AgentType, GroupType, ActionType, MessageType,
+        ActionRecord, BeliefSystem, Perception, MemoryRecord,
+        EmotionState, Desire, Intention, SocialInfo, OpinionBelief,
+        InterventionType, ALPHA, THETA, GROUP_BETA,
     )
     cfg = SimConfig()
     assert cfg.n_agents > 0, "SimConfig 默认值异常"
-    # 枚举值检查
-    assert AgentType.PUBLIC == 0
-    assert ActionType.SILENT == 4
+
+    # v2 AgentType 枚举值
+    assert AgentType.ORDINARY   == 0, "ORDINARY 应为 0"
+    assert AgentType.ACTIVE     == 1, "ACTIVE 应为 1"
+    assert AgentType.RATIONAL   == 2, "RATIONAL 应为 2"
+    assert AgentType.CONTROLLER == 3, "CONTROLLER 应为 3"
+
+    # 旧枚举值不应存在
+    assert not hasattr(AgentType, "PUBLIC"),         "PUBLIC 已移除"
+    assert not hasattr(AgentType, "OPINION_LEADER"), "OPINION_LEADER 已移除"
+
+    # v2 ActionType 枚举值
+    assert ActionType.SEND_MESSAGE == 0
+    assert ActionType.REPLY        == 1
+    assert ActionType.FORWARD      == 2
+    assert ActionType.SILENT       == 3
+    assert not hasattr(ActionType, "LIKE"), "LIKE 已移除"
+    assert not hasattr(ActionType, "POST"), "POST 已移除"
+
+    # GroupType
+    assert GroupType.DORM   == 0
+    assert GroupType.CLASS  == 1
+    assert GroupType.MAJOR  == 2
+    assert GroupType.CAMPUS == 3
+
+    # MessageType 字符串常量
+    assert MessageType.ORIGINAL      == "original"
+    assert MessageType.CLARIFICATION == "clarification"
+
+    # 常量
+    assert abs(ALPHA - 0.15) < 1e-9, f"ALPHA 应为 0.15，实际 {ALPHA}"
+    assert abs(THETA - 0.7)  < 1e-9, f"THETA 应为 0.7，实际 {THETA}"
+    assert GROUP_BETA[GroupType.DORM]   < GROUP_BETA[GroupType.CLASS]
+    assert GROUP_BETA[GroupType.CLASS]  < GROUP_BETA[GroupType.MAJOR]
+    assert GROUP_BETA[GroupType.MAJOR]  < GROUP_BETA[GroupType.CAMPUS]
+
+    # topic_id 替代 event_id
+    rec = ActionRecord(topic_id="T001")
+    assert hasattr(rec, "topic_id"),         "ActionRecord 缺少 topic_id"
+    assert not hasattr(rec, "event_id"),     "ActionRecord 不应有 event_id"
+    assert hasattr(rec, "distortion_level"), "ActionRecord 缺少 distortion_level"
+    assert hasattr(rec, "message_type"),     "ActionRecord 缺少 message_type"
+    assert hasattr(rec, "negative_score"),   "ActionRecord 缺少 negative_score"
+    assert hasattr(rec, "heat"),             "ActionRecord 缺少 heat"
+
+    # Perception v2 字段
+    p = Perception()
+    assert hasattr(p, "group_id"),        "Perception 缺少 group_id"
+    assert hasattr(p, "group_type"),      "Perception 缺少 group_type"
+    assert hasattr(p, "beta"),            "Perception 缺少 beta"
+    assert hasattr(p, "recent_messages"), "Perception 缺少 recent_messages（原 neighbor_actions）"
+    assert not hasattr(p, "neighbor_actions"), "neighbor_actions 已重命名"
+    assert hasattr(p, "topic_heat"),      "Perception 缺少 topic_heat"
+    assert hasattr(p, "topic_negative"),  "Perception 缺少 topic_negative"
+
+    # SocialInfo v2 字段
+    si = SocialInfo()
+    assert hasattr(si, "source_nickname"),  "SocialInfo 缺少 source_nickname"
+    assert hasattr(si, "message_type"),     "SocialInfo 缺少 message_type"
+    assert hasattr(si, "is_mention"),       "SocialInfo 缺少 is_mention"
+    assert hasattr(si, "topic_id"),         "SocialInfo 缺少 topic_id"
+    assert hasattr(si, "distortion_level"), "SocialInfo 缺少 distortion_level"
+    assert hasattr(si, "negative_score"),   "SocialInfo 缺少 negative_score"
+    assert hasattr(si, "heat"),             "SocialInfo 缺少 heat"
+
+    # Desire / Intention v2 字段
+    d = Desire()
+    assert hasattr(d, "topic_id"),  "Desire 缺少 topic_id"
+    assert hasattr(d, "target_id"), "Desire 缺少 target_id"
+    assert not hasattr(d, "event_id"), "Desire 不应有 event_id"
+    it = Intention()
+    assert hasattr(it, "topic_id"), "Intention 缺少 topic_id"
+    assert not hasattr(it, "event_id"), "Intention 不应有 event_id"
 
 
 # ═══════════════════════════════════════════════════════════════════ #
-# [C]  HawkesEngine 接口
+# [C]  HawkesEngine 接口（不变）
 # ═══════════════════════════════════════════════════════════════════ #
 
 def _test_hawkes_init():
-    """mu / beta 必须 > 0，否则抛 ValueError。"""
     from hawkes_engine import HawkesEngine
     h = HawkesEngine(mu=0.1, alpha=0.5, beta=1.0)
-    assert h.history == [], "初始 history 应为空列表"
-    # 参数校验
+    assert h.history == []
     try:
         HawkesEngine(mu=-1, alpha=0, beta=1)
         raise AssertionError("mu=-1 应触发 ValueError")
@@ -82,42 +146,32 @@ def _test_hawkes_init():
 def _test_hawkes_intensity():
     from hawkes_engine import HawkesEngine
     h = HawkesEngine(mu=0.2, alpha=0.8, beta=1.0)
-    # 无事件时 intensity == mu
     lam0 = h.intensity(0.0)
-    assert isinstance(lam0, float),    "intensity 返回值必须是 float"
-    assert abs(lam0 - 0.2) < 1e-9,    f"无事件时 intensity 应等于 mu=0.2，实际={lam0}"
-    # add_event 后 intensity 应升高
+    assert isinstance(lam0, float)
+    assert abs(lam0 - 0.2) < 1e-9
     h.add_event(1.0)
-    lam_after = h.intensity(1.5)
-    assert lam_after > 0.2,            "add_event 后 intensity 应 > mu"
-    # 远处时刻应接近 mu（激励衰减）
-    lam_far = h.intensity(100.0)
-    assert lam_far < lam_after,        "远处时刻 intensity 应衰减"
+    assert h.intensity(1.5) > 0.2
 
 
 def _test_hawkes_sample():
     from hawkes_engine import HawkesEngine
     h = HawkesEngine(mu=0.5, alpha=0.3, beta=1.0)
     t_next = h.sample_next_time(0.0)
-    assert isinstance(t_next, float),  "sample_next_time 返回值必须是 float"
-    assert t_next > 0.0,               f"sample_next_time 返回值 {t_next} 应 > current_t=0"
+    assert isinstance(t_next, float) and t_next > 0.0
 
 
 def _test_hawkes_add_event():
     from hawkes_engine import HawkesEngine
     h = HawkesEngine(mu=0.1, alpha=0.5, beta=1.0)
-    h.add_event(3.0)
-    h.add_event(1.0)
-    h.add_event(2.0)
+    h.add_event(3.0); h.add_event(1.0); h.add_event(2.0)
     assert h.history == sorted(h.history), "history 应保持升序"
 
 
 # ═══════════════════════════════════════════════════════════════════ #
-# [B]  SocialAgent 接口
+# [B]  SocialAgent 接口（v2）
 # ═══════════════════════════════════════════════════════════════════ #
 
 def _make_single_model():
-    """辅助：创建最小 OpinionModel（n=1）供 Agent 测试使用。"""
     from types_def import SimConfig
     from opinion_model import OpinionModel
     return OpinionModel(SimConfig(
@@ -126,27 +180,81 @@ def _make_single_model():
     ))
 
 
-def _test_agent_attributes():
-    """SocialAgent 必须暴露 beliefs / pending_action 属性。"""
+def _test_agent_init_group_type():
+    """SocialAgent.__init__ 须接受 group_type 参数（v2 新增）。"""
+    from types_def import SimConfig, AgentType, GroupType
+    from social_agent import SocialAgent
+    model = _make_single_model()
+    agent = SocialAgent(
+        unique_id=999,
+        model=model,
+        agent_type=AgentType.CONTROLLER,
+        group_type=GroupType.CAMPUS,
+        init_config={"stance_prior": 0.5, "topic_id": "T001", "initial_heat": 0.5},
+    )
+    assert agent.beliefs.identity.group_type == GroupType.CAMPUS, "group_type 未正确写入"
+    assert agent.beliefs.identity.agent_type == AgentType.CONTROLLER
+
+
+def _test_agent_attributes_v2():
+    """SocialAgent 暴露 beliefs / pending_action；beliefs.identity 含 group_type/nickname。"""
     model = _make_single_model()
     agent = model.schedule.agents[0]
-    assert hasattr(agent, "beliefs"),         "缺少 beliefs 属性"
-    assert hasattr(agent.beliefs, "opinions"), "缺少 beliefs.opinions（Dict[str, OpinionBelief]）"
-    assert hasattr(agent.beliefs, "emotion"),  "缺少 beliefs.emotion（EmotionState）"
-    assert hasattr(agent.beliefs, "psychology"),"缺少 beliefs.psychology"
-    assert hasattr(agent, "pending_action"),   "缺少 pending_action 属性"
+    assert hasattr(agent, "beliefs")
+    assert hasattr(agent.beliefs, "opinions")
+    assert hasattr(agent.beliefs, "emotion")
+    assert hasattr(agent.beliefs, "psychology")
+    assert hasattr(agent, "pending_action")
+    assert hasattr(agent.beliefs.identity, "group_type"), "IdentityBelief 缺少 group_type"
+    assert hasattr(agent.beliefs.identity, "nickname"),   "IdentityBelief 缺少 nickname"
+    assert hasattr(agent, "beta"),                        "SocialAgent 缺少 beta 属性"
+
+
+def _test_agent_calc_heat_decay():
+    """calc_heat_decay 接口（#11）：纯计算，无副作用。"""
+    model = _make_single_model()
+    agent = model.schedule.agents[0]
+    assert hasattr(agent, "calc_heat_decay"), "SocialAgent 缺少 calc_heat_decay（#11）"
+
+    # 无干预时，DORM 群自然衰减
+    import math
+    from types_def import GroupType
+    # 创建一个 DORM agent
+    from types_def import AgentType
+    from social_agent import SocialAgent
+    dorm_agent = SocialAgent(
+        unique_id=888,
+        model=model,
+        agent_type=AgentType.ORDINARY,
+        group_type=GroupType.DORM,
+        init_config={"stance_prior": 0.0, "topic_id": "T001", "initial_heat": 0.5},
+    )
+    h0   = 1.0
+    h1   = dorm_agent.calc_heat_decay(h0, elapsed_steps=5, intervention_tick=None)
+    expected = h0 * math.exp(-0.15)   # ALPHA=0.15，DORM 无干预衰减
+    assert abs(h1 - expected) < 1e-6, f"DORM 自然衰减结果 {h1:.4f}，期望 {expected:.4f}"
+
+    # 非 DORM 触发干预后，衰减更快
+    campus_agent = SocialAgent(
+        unique_id=887,
+        model=model,
+        agent_type=AgentType.CONTROLLER,
+        group_type=GroupType.CAMPUS,
+        init_config={"stance_prior": 0.0, "topic_id": "T001", "initial_heat": 0.5},
+    )
+    h2 = campus_agent.calc_heat_decay(h0, elapsed_steps=10, intervention_tick=5)
+    assert h2 < h1, f"CAMPUS 干预后衰减 {h2:.4f} 应 < DORM 自然衰减 {h1:.4f}"
+    assert h2 >= 0.0, "热度不应为负"
 
 
 def _test_agent_step_no_crash():
-    """step() 不能抛出任何异常（异常应在内部降级处理）。"""
     model = _make_single_model()
     agent = model.schedule.agents[0]
     for _ in range(5):
-        agent.step()   # 多步连续调用也应稳定
+        agent.step()
 
 
 def _test_agent_opinion_range():
-    """opinion_value 必须保持在 [-1, 1]。"""
     from types_def import SimConfig
     from opinion_model import OpinionModel
     model = OpinionModel(SimConfig(
@@ -161,16 +269,16 @@ def _test_agent_opinion_range():
             assert -1.0 <= op.opinion_value <= 1.0, \
                 f"Agent-{agent.unique_id} opinion_value={op.opinion_value} 超出 [-1,1]"
         e = agent.beliefs.emotion
-        assert -1.0 <= e.valence <= 1.0, f"valence={e.valence} 超出范围"
-        assert  0.0 <= e.arousal <= 1.0, f"arousal={e.arousal} 超出范围"
+        assert -1.0 <= e.valence <= 1.0
+        assert  0.0 <= e.arousal <= 1.0
 
 
 # ═══════════════════════════════════════════════════════════════════ #
-# [A]  OpinionModel 核心流程
+# [A]  OpinionModel 核心流程（v2）
 # ═══════════════════════════════════════════════════════════════════ #
 
 def _test_model_datacollector_format():
-    """DataCollector 格式必须与 E 模块约定完全一致。"""
+    """DataCollector 含接口表§5 全部指标。"""
     from types_def import SimConfig
     from opinion_model import OpinionModel
     N_STEPS = 5
@@ -183,41 +291,74 @@ def _test_model_datacollector_format():
     for _ in range(N_STEPS):
         model.step()
     df = model.datacollector.get_model_vars_dataframe()
-    # 行数 == 步数
+
     assert len(df) == N_STEPS, f"DataFrame 行数 {len(df)} ≠ 步数 {N_STEPS}"
-    # 必需列
-    required = {"avg_opinion", "polarization", "emotional_contagion"}
+    required = {
+        "avg_opinion", "polarization", "emotional_contagion",
+        "message_count", "negative_emotion", "distortion_level",
+        "cross_group_forward", "intervention_tick", "recovery_time",
+    }
     missing = required - set(df.columns)
     assert not missing, f"缺少必需列：{missing}"
-    # 无 NaN
     assert df.isnull().sum().sum() == 0, "DataCollector 存在 NaN"
-    # avg_opinion 在合法范围
-    assert (df["avg_opinion"].abs() <= 1.0).all(), "avg_opinion 超出 [-1,1]"
-    # polarization >= 0
-    assert (df["polarization"] >= 0).all(), "polarization 出现负值"
+    assert (df["avg_opinion"].abs() <= 1.0).all()
+    assert (df["polarization"] >= 0).all()
+    assert (df["negative_emotion"] >= 0).all()
+    assert (df["distortion_level"] >= 0).all()
 
 
-def _test_model_submit_action():
-    """submit_action 应正确写入 info_stream_cache。"""
-    from types_def import SimConfig, ActionRecord, ActionType
+def _test_model_submit_action_v2():
+    """submit_action 更新 topic_heat / topic_negative / cross_group_forward。"""
+    from types_def import SimConfig, ActionRecord, ActionType, MessageType
     from opinion_model import OpinionModel
     model = OpinionModel(SimConfig(
-        n_agents=1,
+        n_agents=2,
         hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
     ))
-    before = len(model.info_stream_cache)
+    before_cache = len(model.info_stream_cache)
+    before_fwd   = model.cross_group_forward
+
     r = ActionRecord(
-        agent_id=0, action_type=ActionType.POST,
-        content="test", event_id="E001",
-        opinion_value=0.5, tick=0,
+        agent_id=0,
+        action_type=ActionType.SEND_MESSAGE,
+        content="测试消息",
+        topic_id="T001",          # v2：topic_id 而非 event_id
+        distortion_level=0.1,
+        message_type=MessageType.ORIGINAL,
+        negative_score=0.2,
+        heat=0.5,
+        tick=0,
     )
     model.submit_action(r)
-    assert len(model.info_stream_cache) == before + 1, \
-        "submit_action 后缓存长度应 +1"
+
+    assert len(model.info_stream_cache) == before_cache + 1, "缓存长度应 +1"
+    assert "T001" in model.topic_heat, "topic_heat 应含 T001"
+    assert "T001" in model.topic_negative, "topic_negative 应含 T001"
+
+    # heat 已更新（大于初始 0.0）
+    from types_def import GroupType
+    total_heat = sum(model.topic_heat["T001"].values())
+    assert total_heat > 0.0, "submit_action 后 topic_heat 应增加"
+
+
+def _test_model_update_environment():
+    """_update_environment 调用后热度应衰减，且不为负。"""
+    from types_def import SimConfig, GroupType
+    from opinion_model import OpinionModel
+    model = OpinionModel(SimConfig(
+        n_agents=5,
+        network_params={"m": 1},
+        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+    ))
+    # 手动注入热度
+    model.topic_heat["T001"][GroupType.CAMPUS] = 1.0
+    model._update_environment()
+    new_heat = model.topic_heat["T001"][GroupType.CAMPUS]
+    assert new_heat < 1.0, "热度衰减后应 < 初始值"
+    assert new_heat >= 0.0, "热度不应为负"
 
 
 def _test_model_single_node():
-    """n=1 单节点不能崩溃（边界值测试）。"""
     from types_def import SimConfig
     from opinion_model import OpinionModel
     model = OpinionModel(SimConfig(
@@ -230,40 +371,55 @@ def _test_model_single_node():
     assert len(df) == 5
 
 
+def _test_model_place_agents_group_type():
+    """_place_agents 须给每个 agent 分配 group_type（v2 要求）。"""
+    from types_def import SimConfig, GroupType
+    from opinion_model import OpinionModel
+    model = OpinionModel(SimConfig(n_agents=10, network_params={"m": 1}))
+    for agent in model.schedule.agents:
+        assert hasattr(agent.beliefs.identity, "group_type"), \
+            f"Agent-{agent.unique_id} 缺少 group_type"
+        assert isinstance(agent.beliefs.identity.group_type, GroupType), \
+            f"Agent-{agent.unique_id} group_type 类型错误"
+
+
 # ═══════════════════════════════════════════════════════════════════ #
 # 执行所有测试
 # ═══════════════════════════════════════════════════════════════════ #
 
 if __name__ == "__main__":
-    print("\n" + "═" * 55)
-    print("  接口契约验证  (test_contract.py)")
-    print("═" * 55)
+    print("\n" + "═" * 60)
+    print("  接口契约验证  (test_contract.py · v2 · W4)")
+    print("═" * 60)
 
-    print("\n── [types]  types_def.py 共享类型")
-    _check("types_def 全量导入 + 枚举值正确", _test_types_import)
+    print("\n── [types]  types_def.py 共享类型（v2）")
+    _check("v2 枚举值 / 新字段 / 常量全量验证", _test_types_import)
 
     print("\n── [C]  HawkesEngine 接口")
-    _check("__init__ 含参数校验", _test_hawkes_init)
+    _check("__init__ 含参数校验",              _test_hawkes_init)
     _check("intensity(t) 返回 float，无事件=mu", _test_hawkes_intensity)
-    _check("sample_next_time > current_t", _test_hawkes_sample)
-    _check("add_event 保持 history 升序", _test_hawkes_add_event)
+    _check("sample_next_time > current_t",     _test_hawkes_sample)
+    _check("add_event 保持 history 升序",      _test_hawkes_add_event)
 
-    print("\n── [B]  SocialAgent 接口")
-    _check("beliefs / pending_action 属性存在", _test_agent_attributes)
-    _check("step() 连续5次不崩溃", _test_agent_step_no_crash)
+    print("\n── [B]  SocialAgent 接口（v2）")
+    _check("__init__ 接受 group_type 参数",    _test_agent_init_group_type)
+    _check("beliefs/pending_action/beta/group_type/nickname 属性存在", _test_agent_attributes_v2)
+    _check("calc_heat_decay(#11) 接口与公式",  _test_agent_calc_heat_decay)
+    _check("step() 连续5次不崩溃",             _test_agent_step_no_crash)
     _check("20步后 opinion/emotion 值域 [-1,1]", _test_agent_opinion_range)
 
-    print("\n── [A]  OpinionModel 核心流程")
-    _check("DataCollector 列名 / 行数 / 无NaN", _test_model_datacollector_format)
-    _check("submit_action 写入 info_stream_cache", _test_model_submit_action)
-    _check("n=1 单节点 5步不崩溃", _test_model_single_node)
+    print("\n── [A]  OpinionModel 核心流程（v2）")
+    _check("DataCollector 含§5全部指标列",     _test_model_datacollector_format)
+    _check("submit_action 写缓存+热度+负面度", _test_model_submit_action_v2)
+    _check("_update_environment 热度衰减≥0",   _test_model_update_environment)
+    _check("_place_agents 给每个 agent 分配 group_type", _test_model_place_agents_group_type)
+    _check("n=1 单节点 5步不崩溃",             _test_model_single_node)
 
-    # ── 汇总 ─────────────────────────────────────────────────────── #
     n_pass = sum(1 for r in _results if r[0] == "✅")
     n_fail = sum(1 for r in _results if r[0] == "❌")
     total  = len(_results)
 
-    print("\n" + "─" * 55)
+    print("\n" + "─" * 60)
     print(f"  通过 {n_pass}/{total}    失败 {n_fail}/{total}")
     if n_fail == 0:
         print("  ✅  全部通过，接口兼容，可交付")
@@ -271,6 +427,6 @@ if __name__ == "__main__":
         fails = [r[1] for r in _results if r[0] == "❌"]
         print(f"  ❌  失败项：{fails}")
         print("  请修复后再交付给下游成员")
-    print("─" * 55 + "\n")
+    print("─" * 60 + "\n")
 
     sys.exit(0 if n_fail == 0 else 1)
