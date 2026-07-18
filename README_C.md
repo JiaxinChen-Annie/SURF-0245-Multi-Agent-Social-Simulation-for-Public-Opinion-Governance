@@ -1,103 +1,53 @@
-# C 模块：HawkesEngine + LLM 工具链
+# C 模块：HawkesEngine + LLM 工具链（v2）
 
-本目录是 SURF 项目 **Multi-Agent Social Simulation for Public Opinion Governance** 的 C 模块交付代码。
+对齐接口表：**多智能体舆情仿真_全函数接口表_20260718_v2**
 
-C 模块主要提供两部分能力：
+场景：校园多层群聊（DORM/CLASS/MAJOR/CAMPUS）+ 角色（ORDINARY/ACTIVE/RATIONAL/CONTROLLER）
 
-- `HawkesEngine`：舆情事件强度计算、下一个事件时间采样、事件历史记录。
-- `LLM Toolchain`：DeepSeek/OpenAI-compatible 客户端初始化、prompt 构建、LLM 返回解析。
-
-## 文件说明
+## 文件
 
 ```text
-hawkes_engine.py    # Hawkes process engine, interfaces 19-22
-llm_utils.py        # LLM client, prompt builder, response parser, interfaces 31-33
-smoke_test_c.py     # Local smoke test, no API key required
-deepseek_smoke.py   # DeepSeek live API smoke test, API key required
-requirements.txt    # Python dependencies
-.env.example        # Example environment variable file, no real key included
-.gitignore          # Ignores .env, __pycache__, and .pyc files
-HOW_TO_RUN.md       # Detailed run instructions
+hawkes_engine.py    # 接口 21–24：Agent 激活 Hawkes（≠ 群热度 H(t)）
+llm_utils.py        # 接口 33–35：setup_llm_client / build_prompt / parse_llm_response
+smoke_test_c.py     # 本地冒烟（无 Key）
+deepseek_smoke.py   # 真 LLM 冒烟（需 DEEPSEEK_API_KEY）
+requirements.txt
+.env.example
+HOW_TO_RUN.md       # 详细验证步骤（推荐先看）
 ```
 
-## 已实现接口
-
-### HawkesEngine
+## 接口
 
 ```python
-HawkesEngine.__init__(mu: float, alpha: float, beta: float)
-HawkesEngine.intensity(t: float) -> float
-HawkesEngine.sample_next_time(current_t: float) -> float
-HawkesEngine.add_event(t: float) -> None
-```
+HawkesEngine(mu, alpha, beta)  # 可选 rng=
+.intensity(t) -> float
+.sample_next_time(current_t) -> float
+.add_event(t) -> None
 
-### LLM Toolchain
-
-```python
-setup_llm_client(llm_config: Dict[str, Any]) -> LLMClient
+setup_llm_client(llm_config) -> LLMClient  # .chat(str)->str
 build_prompt(belief, memory, env_info) -> str
-parse_llm_response(raw: str) -> Dict[str, Any]
+parse_llm_response(raw) -> Dict  # 含 opinion_updates / emotion_delta
 ```
 
-## 快速运行
-
-安装依赖：
+## 快速验证
 
 ```bash
 pip install -r requirements.txt
-```
-
-运行本地冒烟测试（不需要 DeepSeek Key）：
-
-```bash
 python smoke_test_c.py
 ```
 
-期望最后输出：
-
-```text
-C module smoke test passed.
-```
-
-## DeepSeek API 测试
-
-请在终端中设置 API Key。**不要把真实 Key 写进代码或上传到 GitHub。**
-
-Windows CMD / Anaconda Prompt:
+填 Key 后：
 
 ```bat
 set DEEPSEEK_API_KEY=your_real_key
+set DEEPSEEK_MODEL=deepseek-v4-flash
 python deepseek_smoke.py
 ```
 
-PowerShell:
+模型说明：官网 OpenAI 兼容 `base_url=https://api.deepseek.com`；推荐 `deepseek-v4-flash`（或 `deepseek-v4-pro`）。`deepseek-chat` 将于 2026/07/24 弃用。
 
-```powershell
-$env:DEEPSEEK_API_KEY="your_real_key"
-python deepseek_smoke.py
-```
+细节与验收标准见 `HOW_TO_RUN.md`。
 
-## 和其他模块的联调说明
+## 安全
 
-### 和 A 模块 `OpinionModel`
-
-A 模块可以把 `HawkesEngine` 挂到 `self.hawkes` 上：
-
-- 调用 `intensity(t)` 获取当前舆情事件强度。
-- 调用 `add_event(t)` 记录一次事件/行动发生。
-
-### 和 B 模块 `SocialAgent`
-
-B 模块可以把 `LLMUtils` 挂到 `self.model.llm_utils` 上。
-
-推荐调用流程：
-
-```text
-build_prompt(...) -> client.chat(prompt) -> parse_llm_response(...)
-```
-
-## 安全注意事项
-
-- 不要上传 `.env`。
-- 不要提交任何真实 DeepSeek API Key。
-- `.env.example` 只是模板，可以上传。
+不要提交真实 API Key；不要上传 `.env`。

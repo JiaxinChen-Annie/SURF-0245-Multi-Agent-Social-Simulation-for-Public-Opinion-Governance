@@ -1,5 +1,10 @@
 """
-Hawkes process engine for module C (functions 19-22).
+Hawkes process engine for module C (interfaces 21-24).
+
+职责分工（与校园群聊 H(t) 热度公式区分）：
+  - HawkesEngine：Agent 激活强度 / 事件爆发采样（A.step 用 intensity）
+  - H(t)=H(t)*e^{-α}*e^{-β_k·1[t≥t_int]}：群话题热度衰减（A._update_environment）
+两者独立，不要混用参数名含义。
 """
 
 from __future__ import annotations
