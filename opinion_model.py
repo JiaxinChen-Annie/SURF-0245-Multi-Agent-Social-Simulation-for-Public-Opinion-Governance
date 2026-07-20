@@ -22,6 +22,13 @@ opinion_model.py — 模型/环境层（接口表 #12–20）
   - intervention_tick 由本模块统一维护（B 模块写的为参考值，A 为权威）
   - 所有 event_id → topic_id，枚举对齐新版
 
+【W4 LLM 接入变更】
+  - __init__ 新增 ⑤-b：读取 config.llm_config，调用 C 模块 setup_llm_client
+    初始化 self._llm_client，挂载到模型实例供所有 SocialAgent 通过
+    self.model._llm_client 取用
+  - llm_config 为空 {} 时 _llm_client = None，SocialAgent 自动降级规则存根
+  - llm_config 含 fallback_mock: true 时，初始化失败也不崩溃
+
 注意：B 模块的 calc_heat_decay() 是热度衰减的纯计算函数，
       A 模块在 _update_environment 中调用它，不自行实现衰减公式。
       若 B 模块尚未交付，使用本文件内置的 _fallback_heat_decay() 降级。
@@ -63,7 +70,9 @@ class OpinionModel(Model):
     场景：大学校园多群舆情扩散（DORM/CLASS/MAJOR/CAMPUS 四类群）。
     角色：ORDINARY / ACTIVE / RATIONAL / CONTROLLER。
     核心热度演化公式（由 B 模块 calc_heat_decay 提供，A 模块调用）：
-        H_k(t+1) = H_k(t) · e^(-α) · e^(-β_k · 𝟙[t ≥ t_k^int])
+        H_k(t+1) = H_k(t) · e^(-α) · e^(-β_k · 𝟙[t ≥ t_k^int])\n
+    LLM 客户端（C 模块）挂载在 self._llm_client，
+    供所有 SocialAgent 通过 self.model._llm_client 访问。
     """
 
     # ================================================================== #
@@ -131,6 +140,41 @@ class OpinionModel(Model):
             beta  = config.hawkes_params.get("beta",  1.0),
         )
 
+        # ⑤-b LLM 客户端（C 模块）—— W4 新增
+        #
+        # 读取 config.llm_config，调用 C 模块的 setup_llm_client 工厂函数，
+        # 将返回的客户端实例挂载为 self._llm_client。
+        #
+        # SocialAgent._update_beliefs 通过 self.model._llm_client 取用：
+        #   - _llm_client 不为 None  → 走 LLM 路径（C 模块）
+        #   - _llm_client 为 None    → 降级为规则存根（Deffuant-Weisbuch）
+        #
+        # config.llm_config 示例（config.yaml 中填写）：
+        #   provider: deepseek
+        #   api_key: ""          # 留空则读环境变量 DEEPSEEK_API_KEY
+        #   model: deepseek-v4-flash
+        #   temperature: 0.3
+        #   timeout: 30
+        #   max_retries: 2
+        #   fallback_mock: true  # 初始化失败时自动降级 MockLLMClient，不崩溃
+        #
+        # 若 llm_config 为空 {}，则跳过初始化，_llm_client = None。
+        self._llm_client = None
+        if config.llm_config:
+            try:
+                from llm_utils import setup_llm_client
+                self._llm_client = setup_llm_client(config.llm_config)
+                _LOG.info(
+                    f"LLM 客户端初始化成功 | "
+                    f"provider={config.llm_config.get('provider', '?')} | "
+                    f"model={config.llm_config.get('model', '?')}"
+                )
+            except Exception as e:
+                _LOG.warning(
+                    f"LLM 客户端初始化失败，所有 Agent 将使用规则存根: {e}"
+                )
+                # _llm_client 保持 None，SocialAgent 自动降级，不影响仿真运行
+
         # ⑥ DataCollector（E 模块从此处读取输出）
         #    指标对齐接口表§5：message_count / avg_opinion / polarization /
         #    negative_emotion / distortion_level / cross_group_forward /
@@ -163,6 +207,7 @@ class OpinionModel(Model):
             f"OpinionModel 初始化完成 | "
             f"n_agents={config.n_agents} | "
             f"network={config.network_type} | "
+            f"llm={'已接入' if self._llm_client is not None else '规则存根'} | "
             f"mesa={'系统' if _MESA_REAL else '垫片'}"
         )
 

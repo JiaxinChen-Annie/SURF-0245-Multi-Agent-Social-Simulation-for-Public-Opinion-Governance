@@ -6,6 +6,9 @@
 # 【v2 变更】
 #   agent_type_ratio 键名对齐新 AgentType: ORDINARY/ACTIVE/RATIONAL/CONTROLLER
 #   新增 group_type_ratio: DORM/CLASS/MAJOR/CAMPUS
+#
+# 【W4 LLM 变更】
+#   llm_config 新增完整配置字段，详见下方注释
 
 n_agents: 100
 
@@ -32,6 +35,29 @@ hawkes_params:
   alpha: 0.5    # 激励系数
   beta:  1.0    # 衰减系数
 
-llm_config: {}   # W4 阶段暂不使用 LLM，留空
+# ── LLM 配置（W4 新增）────────────────────────────────────────────────────
+#
+# 三种使用方式：
+#
+# 方式 A：本地测试（无需 API Key，Agent 全部走规则存根）
+#   llm_config: {}
+#
+# 方式 B：Mock 模式（import llm_utils 成功，但不调真实 API）
+#   llm_config:
+#     provider: mock
+#
+# 方式 C：接入 DeepSeek 真实 API
+#   llm_config:
+#     provider: deepseek
+#     api_key: ""            # 留空则读环境变量 DEEPSEEK_API_KEY
+#     model: deepseek-v4-flash
+#     temperature: 0.3
+#     timeout: 30
+#     max_retries: 2
+#     fallback_mock: true    # Key 失效 / 网络错误时自动降级，不崩溃
+#
+# ── 当前设置（方式 B，联调冒烟验证推荐）──────────────────────────────────
+llm_config:
+  provider: mock            # 改为 deepseek 即接入真实 API
 
 random_seed: null   # null = 每次随机种子

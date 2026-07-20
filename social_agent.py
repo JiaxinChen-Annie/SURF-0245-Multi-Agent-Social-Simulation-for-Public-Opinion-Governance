@@ -12,6 +12,14 @@ social_agent.py — 智能体层（接口表 #1–11）
   - __init__ 新增 group_type 参数（A 模块实例化时传入）
   - 新增 calc_heat_decay (#11，A 模块在 _update_environment 中调用)
 
+【W4 LLM 接入变更】
+  - _update_beliefs 改为双路径：优先走 LLM（C 模块），失败时自动降级规则存根
+  - LLM 路径：从 self.model._llm_client 取客户端，调用 C 模块
+    build_prompt / chat / parse_llm_response，将返回的
+    opinion_updates 和 emotion_delta 写入 self.beliefs
+  - 降级路径：原 Deffuant-Weisbuch 有界置信度规则，逻辑不变
+  - _llm_client 为 None（config.llm_config 为空）时仅走规则存根
+
 B 同学 S2 阶段用真实 LLM 版本替换 _update_beliefs 即可。
 """
 
@@ -54,6 +62,23 @@ _LEARNING_RATE: Dict[AgentType, float] = {
     AgentType.CONTROLLER: 0.01,
 }
 _MEMORY_CAPACITY = 20   # 短期记忆最大条数
+
+# ─── C 模块懒加载（避免无 llm_utils 时整体崩溃）───────────────────────────── #
+_llm_utils_module = None
+
+def _get_llm_utils():
+    """
+    懒加载 C 模块 llm_utils。
+    首次调用时尝试 import，成功后缓存；失败则返回 None，后续不重试。
+    """
+    global _llm_utils_module
+    if _llm_utils_module is None:
+        try:
+            import llm_utils as _m
+            _llm_utils_module = _m
+        except ImportError:
+            _llm_utils_module = False   # 标记为"已尝试但不可用"
+    return _llm_utils_module if _llm_utils_module else None
 
 
 class SocialAgent(Agent):
@@ -240,7 +265,7 @@ class SocialAgent(Agent):
         return list(self.memory)[-5:]
 
     # ------------------------------------------------------------------ #
-    #  #6  _update_beliefs  （S1 规则存根；S2 替换为 LLM）                  #
+    #  #6  _update_beliefs  （W4：LLM 优先，规则存根降级）                  #
     # ------------------------------------------------------------------ #
     def _update_beliefs(
         self,
@@ -248,10 +273,94 @@ class SocialAgent(Agent):
         memories: List[MemoryRecord],
     ) -> None:
         """
-        有界置信度模型（Deffuant-Weisbuch）存根。
-        LLM 失败或 S1 阶段均使用此规则。
+        W4 双路径信念更新：
+          1) LLM 路径（优先）：调用 C 模块工具链，将 opinion_updates /
+             emotion_delta 写入 self.beliefs。
+          2) 规则降级路径：有界置信度模型（Deffuant-Weisbuch），
+             LLM 不可用或调用失败时自动切换。
+
+        LLM 路径触发条件（同时满足）：
+          - C 模块 llm_utils 可以 import
+          - self.model._llm_client 不为 None（A 模块在 __init__ 中挂载）
+
         opinion_value ∈ [-1, 1]，emotion clip 处理。
         """
+
+        # ══════════════════════════════════════════════════════════════ #
+        #  路径 1：LLM（C 模块 llm_utils）                               #
+        # ══════════════════════════════════════════════════════════════ #
+        llm_mod    = _get_llm_utils()
+        llm_client = getattr(self.model, "_llm_client", None)
+
+        if llm_mod is not None and llm_client is not None:
+            try:
+                # ── 构造 env_info（对齐 C 模块 build_prompt 期望的字段）──
+                env_info = {
+                    "group_type": self.beliefs.identity.group_type.name,
+                    "beta":       self.beta,
+                    "role":       self.beliefs.identity.agent_type.name,
+                    "nickname":   self.beliefs.identity.nickname,
+                    # recent_messages 转为字符串列表（C 模块 prompt 模板格式）
+                    "recent_messages": [
+                        f"[{si.message_type.name if hasattr(si.message_type, 'name') else si.message_type}]"
+                        f" {si.source_nickname or si.source_id}: {si.content}"
+                        for si in perception.recent_messages[:5]
+                    ],
+                    "mentions": [si.content for si in perception.mentions[:3]],
+                    "topic_heat":     perception.topic_heat,
+                    "topic_negative": perception.topic_negative,
+                }
+
+                # ── 调用 C 模块三个接口 ────────────────────────────────
+                prompt = llm_mod.build_prompt(self.beliefs, list(memories), env_info)
+                raw    = llm_client.chat(prompt)
+                result = llm_mod.parse_llm_response(raw)
+
+                # ── 写回 opinion_updates ───────────────────────────────
+                for tid, delta in result.get("opinion_updates", {}).items():
+                    if tid not in self.beliefs.opinions:
+                        self.beliefs.opinions[tid] = OpinionBelief(topic_id=tid)
+                    old_val = self.beliefs.opinions[tid].opinion_value
+                    self.beliefs.opinions[tid].opinion_value = float(
+                        np.clip(old_val + delta, -1.0, 1.0)
+                    )
+
+                # ── 写回 emotion_delta ────────────────────────────────
+                ed = result.get("emotion_delta", {})
+                self.beliefs.emotion.valence = float(np.clip(
+                    self.beliefs.emotion.valence + ed.get("valence", 0.0),
+                    -1.0, 1.0,
+                ))
+                self.beliefs.emotion.arousal = float(np.clip(
+                    self.beliefs.emotion.arousal + ed.get("arousal", 0.0),
+                    0.0, 1.0,
+                ))
+
+                # ── 写入记忆（与规则路径逻辑一致）───────────────────────
+                for si in perception.recent_messages[:3]:
+                    self.memory.append(MemoryRecord(
+                        tick=perception.tick,
+                        info=si,
+                        relevance=float(1.0 - abs(si.negative_score - 0.5)),
+                    ))
+
+                _LOG.debug(
+                    f"Agent-{self.unique_id} LLM 路径成功 | "
+                    f"action={result.get('action_type_name', '?')} | "
+                    f"opinion_updates={result.get('opinion_updates', {})}"
+                )
+                return   # LLM 路径完成，跳过规则存根
+
+            except Exception as e:
+                # LLM 调用失败：打日志后自动降级，不向上抛出
+                _LOG.debug(
+                    f"Agent-{self.unique_id} LLM 路径失败，降级规则存根: {e}"
+                )
+
+        # ══════════════════════════════════════════════════════════════ #
+        #  路径 2：规则降级（Deffuant-Weisbuch 有界置信度模型）            #
+        #  LLM 不可用 / 调用失败 / llm_config 为空时执行此路径            #
+        # ══════════════════════════════════════════════════════════════ #
         agent_type = self.beliefs.identity.agent_type
         eps = _CONFIDENCE_BOUND[agent_type]
         mu  = _LEARNING_RATE[agent_type]
