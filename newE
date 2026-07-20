@@ -1,0 +1,943 @@
+"""
+多智能体舆情仿真 — 自定义类型定义（微信群聊场景 v2）
+数据契约，所有模块共享
+
+角色：ORDINARY / ACTIVE / RATIONAL / CONTROLLER
+群类型：DORM / CLASS / MAJOR / CAMPUS
+消息类型：original / forward / paraphrase / exaggerate / clarification
+"""
+
+from enum import IntEnum
+from typing import Dict, List, Optional, Any
+
+# ====================================================================
+# 枚举定义
+# ====================================================================
+
+class AgentType(IntEnum):
+    ORDINARY = 0      # 普通群员（多数沉默，偶尔附和/提问）
+    ACTIVE = 1        # 活跃讨论者（乐于转发、分享信息）
+    RATIONAL = 2      # 理性讨论者（质疑、查证、分析逻辑）
+    CONTROLLER = 3    # 管理者（提醒、澄清、禁言、公告）
+
+
+class GroupType(IntEnum):
+    DORM = 0          # 宿舍群（管理强度很弱，低曝光）
+    CLASS = 1         # 班级群（管理强度中弱）
+    MAJOR = 2         # 专业群（管理强度中）
+    CAMPUS = 3        # 校园群（管理强度强，高曝光）
+
+
+# 干预衰减率 βₖ
+# 约束：β₁ < β₂ < β₃ < β₄
+GROUP_BETA = {
+    GroupType.DORM: 0.05,      # β₁
+    GroupType.CLASS: 0.12,     # β₂
+    GroupType.MAJOR: 0.20,     # β₃
+    GroupType.CAMPUS: 0.30,    # β₄
+}
+
+
+class ActionType(IntEnum):
+    SEND_MESSAGE = 0  # 发新消息
+    REPLY = 1         # 回复他人消息
+    FORWARD = 2       # 转发消息
+    SILENT = 3        # 沉默
+
+
+# 消息类型（5类，与 ActionType 独立）
+class MessageType:
+    ORIGINAL = "original"
+    FORWARD = "forward"
+    PARAPHRASE = "paraphrase"
+    EXAGGERATE = "exaggerate"
+    CLARIFICATION = "clarification"
+
+
+# ====================================================================
+# 数据类
+# ====================================================================
+
+class Personality:
+    """五因素人格"""
+    def __init__(self, openness=0.5, conscientiousness=0.5, extraversion=0.5,
+                 agreeableness=0.5, neuroticism=0.5):
+        self.openness = max(0.0, min(1.0, openness))
+        self.conscientiousness = max(0.0, min(1.0, conscientiousness))
+        self.extraversion = max(0.0, min(1.0, extraversion))
+        self.agreeableness = max(0.0, min(1.0, agreeableness))
+        self.neuroticism = max(0.0, min(1.0, neuroticism))
+
+    def to_dict(self):
+        return {k: getattr(self, k) for k in
+                ["openness", "conscientiousness", "extraversion",
+                 "agreeableness", "neuroticism"]}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(**{k: float(v) for k, v in d.items()})
+
+
+class EmotionState:
+    """情绪状态"""
+    def __init__(self, valence=0.0, arousal=0.5):
+        self.valence = max(-1.0, min(1.0, valence))
+        self.arousal = max(0.0, min(1.0, arousal))
+
+    def to_dict(self):
+        return {"valence": self.valence, "arousal": self.arousal}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(valence=float(d.get("valence", 0)),
+                   arousal=float(d.get("arousal", 0.5)))
+
+
+class IdentityBelief:
+    """身份信念（v2：加入 group_type、nickname）"""
+    def __init__(self, agent_type=AgentType.ORDINARY,
+                 group_type=GroupType.CLASS,
+                 nickname="", role_desc="", stance_prior=0.0):
+        self.agent_type = agent_type
+        self.group_type = group_type
+        self.nickname = nickname
+        self.role_desc = role_desc
+        self.stance_prior = max(-1.0, min(1.0, stance_prior))
+
+    def to_dict(self):
+        return {"agent_type": int(self.agent_type),
+                "group_type": int(self.group_type),
+                "nickname": self.nickname,
+                "role_desc": self.role_desc,
+                "stance_prior": self.stance_prior}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(agent_type=AgentType(d.get("agent_type", 0)),
+                   group_type=GroupType(d.get("group_type", 1)),
+                   nickname=str(d.get("nickname", "")),
+                   role_desc=str(d.get("role_desc", "")),
+                   stance_prior=float(d.get("stance_prior", 0)))
+
+
+class PsychologyBelief:
+    """心理信念"""
+    def __init__(self, personality=None, risk_aversion=0.5):
+        self.personality = personality or Personality()
+        self.risk_aversion = max(0.0, min(1.0, risk_aversion))
+
+    def to_dict(self):
+        return {"personality": self.personality.to_dict(),
+                "risk_aversion": self.risk_aversion}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(personality=Personality.from_dict(d.get("personality", {})),
+                   risk_aversion=float(d.get("risk_aversion", 0.5)))
+
+
+class OpinionBelief:
+    """观点信念（按话题组织，v2：event_id → topic_id）"""
+    def __init__(self, topic_id="", opinion_value=0.0, confidence=0.5):
+        self.topic_id = topic_id
+        self.opinion_value = max(-1.0, min(1.0, opinion_value))
+        self.confidence = max(0.0, min(1.0, confidence))
+
+    def to_dict(self):
+        return {"topic_id": self.topic_id,
+                "opinion_value": self.opinion_value,
+                "confidence": self.confidence}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(topic_id=str(d.get("topic_id", "")),
+                   opinion_value=float(d.get("opinion_value", 0)),
+                   confidence=float(d.get("confidence", 0.5)))
+
+
+class BeliefSystem:
+    """四层信念系统"""
+    def __init__(self, identity=None, psychology=None,
+                 opinions=None, emotion=None):
+        self.identity = identity or IdentityBelief()
+        self.psychology = psychology or PsychologyBelief()
+        self.opinions = opinions or {}  # Dict[str, OpinionBelief]
+        self.emotion = emotion or EmotionState()
+
+    def to_dict(self):
+        return {"identity": self.identity.to_dict(),
+                "psychology": self.psychology.to_dict(),
+                "opinions": {k: v.to_dict() for k, v in self.opinions.items()},
+                "emotion": self.emotion.to_dict()}
+
+
+class SocialInfo:
+    """微信消息信息（v2：大幅扩充字段）"""
+    def __init__(self, source_id=0, source_nickname="", content="",
+                 message_type=MessageType.ORIGINAL, timestamp=0,
+                 is_mention=False, topic_id="",
+                 distortion_level=0.0, original_content="",
+                 negative_score=0.0, heat=0.0):
+        self.source_id = source_id
+        self.source_nickname = source_nickname
+        self.content = content
+        self.message_type = message_type
+        self.timestamp = timestamp
+        self.is_mention = is_mention
+        self.topic_id = topic_id
+        self.distortion_level = max(0.0, min(1.0, distortion_level))
+        self.original_content = original_content
+        self.negative_score = max(0.0, min(1.0, negative_score))
+        self.heat = max(0.0, heat)
+
+    def to_dict(self):
+        return {"source_id": self.source_id,
+                "source_nickname": self.source_nickname,
+                "content": self.content,
+                "message_type": self.message_type,
+                "timestamp": self.timestamp,
+                "is_mention": self.is_mention,
+                "topic_id": self.topic_id,
+                "distortion_level": self.distortion_level,
+                "original_content": self.original_content,
+                "negative_score": self.negative_score,
+                "heat": self.heat}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(source_id=int(d.get("source_id", 0)),
+                   source_nickname=str(d.get("source_nickname", "")),
+                   content=str(d.get("content", "")),
+                   message_type=str(d.get("message_type", MessageType.ORIGINAL)),
+                   timestamp=int(d.get("timestamp", 0)),
+                   is_mention=bool(d.get("is_mention", False)),
+                   topic_id=str(d.get("topic_id", "")),
+                   distortion_level=float(d.get("distortion_level", 0)),
+                   original_content=str(d.get("original_content", "")),
+                   negative_score=float(d.get("negative_score", 0)),
+                   heat=float(d.get("heat", 0)))
+
+
+class Perception:
+    """
+    感知对象（v2：群聊场景）
+    B 模块仅读取，权威状态由 A 模块维护。
+    """
+    def __init__(self, group_id="", group_type=GroupType.CLASS, beta=0.0,
+                 recent_messages=None, mentions=None, tick=0,
+                 topic_heat=None, topic_negative=None):
+        self.group_id = group_id
+        self.group_type = group_type
+        self.beta = beta
+        self.recent_messages = recent_messages or []
+        self.mentions = mentions or []
+        self.tick = tick
+        self.topic_heat = topic_heat or {}
+        self.topic_negative = topic_negative or {}
+
+
+class MemoryRecord:
+    """记忆记录"""
+    def __init__(self, tick=0, info=None, relevance=0.5):
+        self.tick = tick
+        self.info = info or SocialInfo()
+        self.relevance = max(0.0, min(1.0, relevance))
+
+    def to_dict(self):
+        return {"tick": self.tick, "info": self.info.to_dict(),
+                "relevance": self.relevance}
+
+
+class Desire:
+    """
+    欲望（BDI 体系）
+    B 模块 BDI 推理的中间产物，E 模块仅需知道其存在。
+    """
+    def __init__(self, goal_type="", priority=0.0,
+                 topic_id="", target_id=None):
+        self.goal_type = goal_type      # reply / discuss / share / clarify / intervene / silent
+        self.priority = max(0.0, min(1.0, priority))
+        self.topic_id = topic_id
+        self.target_id = target_id
+
+
+class Intention:
+    """
+    意图（BDI 体系）
+    B 模块 BDI 推理的中间产物，E 模块仅需知道其存在。
+    """
+    def __init__(self, action_type=ActionType.SILENT, content_plan="",
+                 topic_id="", target_id=None):
+        self.action_type = action_type
+        self.content_plan = content_plan
+        self.topic_id = topic_id
+        self.target_id = target_id
+
+
+class ActionRecord:
+    """
+    行动记录（v2：ActionType + MessageType 双体系）
+    - action_type: SEND_MESSAGE / REPLY / FORWARD / SILENT
+    - message_type: original / forward / paraphrase / exaggerate / clarification
+    """
+    def __init__(self, agent_id=0, action_type=ActionType.SILENT, content="",
+                 target_id=None, tick=0, topic_id="",
+                 distortion_level=0.0,
+                 message_type=MessageType.ORIGINAL,
+                 negative_score=0.0, heat=0.0):
+        self.agent_id = agent_id
+        self.action_type = action_type
+        self.content = content
+        self.target_id = target_id
+        self.tick = tick
+        self.topic_id = topic_id
+        self.distortion_level = max(0.0, min(1.0, distortion_level))
+        self.message_type = message_type
+        self.negative_score = max(0.0, min(1.0, negative_score))
+        self.heat = max(0.0, heat)
+
+    def to_dict(self):
+        return {"agent_id": self.agent_id,
+                "action_type": int(self.action_type),
+                "content": self.content,
+                "target_id": self.target_id,
+                "tick": self.tick,
+                "topic_id": self.topic_id,
+                "distortion_level": self.distortion_level,
+                "message_type": self.message_type,
+                "negative_score": self.negative_score,
+                "heat": self.heat}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(agent_id=int(d.get("agent_id", 0)),
+                   action_type=ActionType(d.get("action_type", 3)),
+                   content=str(d.get("content", "")),
+                   target_id=d.get("target_id"),
+                   tick=int(d.get("tick", 0)),
+                   topic_id=str(d.get("topic_id", "")),
+                   distortion_level=float(d.get("distortion_level", 0)),
+                   message_type=str(d.get("message_type", MessageType.ORIGINAL)),
+                   negative_score=float(d.get("negative_score", 0)),
+                   heat=float(d.get("heat", 0)))
+
+
+class SimConfig:
+    """仿真配置（v2：支持群类型配置）"""
+    def __init__(self, n_agents=50, agent_type_ratio=None,
+                 group_type_ratio=None,
+                 network_type="small_world", network_params=None,
+                 n_steps=100, topics=None,
+                 alpha=0.15, theta=0.7,
+                 hawkes_params=None, llm_config=None,
+                 random_seed=42):
+        self.n_agents = n_agents
+        self.agent_type_ratio = agent_type_ratio or {
+            "ORDINARY": 0.7, "ACTIVE": 0.15,
+            "RATIONAL": 0.1, "CONTROLLER": 0.05}
+        self.group_type_ratio = group_type_ratio or {
+            "DORM": 0.25, "CLASS": 0.35,
+            "MAJOR": 0.25, "CAMPUS": 0.15}
+        self.network_type = network_type
+        self.network_params = network_params or {}
+        self.n_steps = n_steps
+        self.topics = topics or ["general"]
+        self.alpha = alpha        # 自然衰减率 α
+        self.theta = theta        # 干预触发阈值 θ
+        self.hawkes_params = hawkes_params or {}
+        self.llm_config = llm_config or {}
+        self.random_seed = random_seed
+
+    def to_dict(self):
+        return {"n_agents": self.n_agents,
+                "agent_type_ratio": self.agent_type_ratio,
+                "group_type_ratio": self.group_type_ratio,
+                "network_type": self.network_type,
+                "network_params": self.network_params,
+                "n_steps": self.n_steps,
+                "topics": self.topics,
+                "alpha": self.alpha,
+                "theta": self.theta,
+                "hawkes_params": self.hawkes_params,
+                "llm_config": self.llm_config,
+                "random_seed": self.random_seed}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(n_agents=int(d.get("n_agents", 50)),
+                   agent_type_ratio=d.get("agent_type_ratio"),
+                   group_type_ratio=d.get("group_type_ratio"),
+                   network_type=str(d.get("network_type", "small_world")),
+                   network_params=d.get("network_params"),
+                   n_steps=int(d.get("n_steps", 100)),
+                   topics=d.get("topics"),
+                   alpha=float(d.get("alpha", 0.15)),
+                   theta=float(d.get("theta", 0.7)),
+                   hawkes_params=d.get("hawkes_params"),
+                   llm_config=d.get("llm_config"),
+                   random_seed=int(d.get("random_seed", 42)))
+
+"""E 模块自测（v2）— 跑通 = 模块正确"""
+import sys, os, json, tempfile
+sys.path.insert(0, os.path.expanduser("~/Desktop/opinion_simulation"))
+os.environ["MPLBACKEND"] = "Agg"
+
+import pandas as pd, numpy as np
+from sim_types import *
+from utils import *
+
+ok, fail = 0, 0
+def t(name, cond, *a):
+    global ok, fail
+    if cond: ok += 1; print(f"  ✅ {name}")
+    else: fail += 1; print(f"  ❌ {name}")
+
+# ── #30 load_config ──
+f = tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False)
+f.write("n_agents: 50\nnetwork_type: barabasi_albert\nn_steps: 30\nrandom_seed: 7\n"); f.close()
+cfg = load_config(f.name)
+t("load_config(YAML)", cfg.n_agents == 50 and cfg.network_type == "barabasi_albert")
+os.unlink(f.name)
+
+f = tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False)
+json.dump({"n_agents":100,"n_steps":50}, f); f.close()
+cfg = load_config(f.name)
+t("load_config(JSON)", cfg.n_agents == 100)
+os.unlink(f.name)
+
+try: load_config("/tmp/nope.yaml"); t("load_config(missing)→报错", False)
+except FileNotFoundError: t("load_config(missing)→报错", True)
+
+# ── #31 setup_llm_client ──
+client = setup_llm_client({"provider":"openai","model":"gpt-3.5-turbo"})
+t("setup_llm_client→有chat方法", hasattr(client,"chat"))
+resp = client.chat("hi")
+t("setup_llm_client→chat返回str", isinstance(resp, str))
+t("setup_llm_client→chat非空", len(resp) > 0)
+
+# ── #32 build_prompt (Dict env_info) ──
+belief = BeliefSystem(
+    identity=IdentityBelief(AgentType.ORDINARY, GroupType.DORM, "小明", "普通学生", 0.0),
+    psychology=PsychologyBelief(Personality(), 0.3),
+    emotion=EmotionState(0.2, 0.6))
+mem = [MemoryRecord(0, SocialInfo(source_id=5, source_nickname="小红",
+                                   content="今天食堂好贵", message_type=MessageType.ORIGINAL,
+                                   topic_id="food_price", negative_score=0.3), 0.9)]
+env_info = {
+    "group_type": "DORM",
+    "beta": 0.05,
+    "role": "ORDINARY",
+    "nickname": "小明",
+    "recent_messages": ["[original] 小红: 今天食堂好贵"],
+    "mentions": [],
+    "topic_heat": {"food_price": 0.6},
+    "topic_negative": {"food_price": 0.3},
+    "tick": 5,
+}
+prompt = build_prompt(belief, mem, env_info)
+t("build_prompt→返回str", isinstance(prompt, str))
+t("build_prompt→包含action指令", "action_type" in prompt.lower())
+t("build_prompt→包含消息类型选项", "message_type" in prompt.lower())
+t("build_prompt→包含群类型", "DORM" in prompt)
+t("build_prompt→包含昵称", "小明" in prompt)
+
+# ── #33 parse_llm_response (v2：支持 message_type、topic_id) ──
+r = parse_llm_response('{"action_type":"SEND_MESSAGE","content":"支持","topic_id":"food_price","message_type":"original","target_id":null}')
+t("parse→plain JSON action_type", r["action_type"] == ActionType.SEND_MESSAGE)
+t("parse→plain JSON message_type", r["message_type"] == "original")
+t("parse→plain JSON topic_id", r["topic_id"] == "food_price")
+
+r2 = parse_llm_response('x\n```json\n{"action_type":"REPLY","content":"我也觉得","topic_id":"general","message_type":"original"}\n```\ny')
+t("parse→markdown ```json", r2["action_type"] == ActionType.REPLY)
+
+r3 = parse_llm_response("一堆乱码文字")
+t("parse→乱码→SILENT兜底", r3["action_type"] == ActionType.SILENT)
+
+r4 = parse_llm_response('{"action_type":"SEND_MESSAGE","message_type":"clarification"}')
+t("parse→clarification 有效", r4["message_type"] == "clarification")
+
+r5 = parse_llm_response('{"action_type":"FORWARD","message_type":"exaggerate"}')
+t("parse→exaggerate 有效", r5["message_type"] == "exaggerate")
+
+# ── #34 save_simulation_results ──
+df = pd.DataFrame({"tick":[0,1],"avg_opinion":[0.5,-0.5],"polarization":[0.1,0.2],
+                    "topic_heat":[0.8,0.6],"negative_score":[0.3,0.5]})
+out = save_simulation_results(df, os.path.join(tempfile.gettempdir(),"est"),"csv")
+dfc = pd.read_csv(out)
+t("导出CSV→文件存在", os.path.exists(out))
+t("导出CSV→16bit编码[int]", isinstance(int(dfc.loc[0,"avg_opinion"]), int))
+
+out2 = save_simulation_results(df, os.path.join(tempfile.gettempdir(),"est"),"json")
+t("导出JSON→文件存在", os.path.exists(out2))
+
+try: save_simulation_results(df, "/tmp/x","xml"); t("bad→报错", False)
+except ValueError: t("bad→报错", True)
+
+# ── #35 visualize_trend ──
+dft = pd.DataFrame({"tick":range(5),"avg_opinion":[0.0,0.2,0.5,0.3,0.1]})
+img = visualize_trend(dft, ["avg_opinion"], "/tmp/etrend")
+t("趋势图→生成PNG", os.path.exists(img) and img.endswith(".png"))
+
+dft["experiment_label"] = "A"
+img2 = visualize_trend(dft, ["avg_opinion"], "/tmp/etrend2", "标题")
+t("趋势图→带+对比分组", os.path.exists(img2))
+
+try: visualize_trend(pd.DataFrame({"x":[1]}), ["avg_opinion"],"/tmp/x"); t("缺列→报错", False)
+except KeyError: t("缺列→报错", True)
+
+# ── #36 compute_similarity ──
+t("相似→同文≈1.0", 0.99 <= compute_similarity("hello","hello") <= 1.0)
+t("相似→异文<0.5", compute_similarity("abc","xyz") < 0.5)
+
+# ── #37 get_logger ──
+log = get_logger("test_e_v2", "DEBUG")
+t("logger→DEBUG级别", log.level == 10)
+cached = get_logger("test_e_v2")
+t("logger→缓存复用", cached is log)
+log2 = get_logger("test_e_v2_other")
+t("logger→不同名不同实例", log2 is not log)
+
+# ── 新增：v2 类型完整性测试 ──
+t("AgentType→ORDINARY", AgentType.ORDINARY == 0)
+t("AgentType→CONTROLLER", AgentType.CONTROLLER == 3)
+t("GroupType→DORM", GroupType.DORM == 0)
+t("GroupType→CAMPUS", GroupType.CAMPUS == 3)
+t("ActionType→SEND_MESSAGE", ActionType.SEND_MESSAGE == 0)
+t("ActionType→SILENT", ActionType.SILENT == 3)
+t("MessageType→CLARIFICATION", MessageType.CLARIFICATION == "clarification")
+t("GROUP_BETA 约束", GROUP_BETA[GroupType.DORM] < GROUP_BETA[GroupType.CLASS])
+t("GROUP_BETA 约束", GROUP_BETA[GroupType.CLASS] < GROUP_BETA[GroupType.MAJOR])
+t("GROUP_BETA 约束", GROUP_BETA[GroupType.MAJOR] < GROUP_BETA[GroupType.CAMPUS])
+
+# ActionRecord v2 双体系
+rec = ActionRecord(agent_id=1, action_type=ActionType.SEND_MESSAGE,
+                   content="提醒一下", message_type=MessageType.CLARIFICATION,
+                   topic_id="hot", tick=10,
+                   distortion_level=0.0, negative_score=0.1, heat=0.8)
+t("ActionRecord→action_type", rec.action_type == ActionType.SEND_MESSAGE)
+t("ActionRecord→message_type", rec.message_type == "clarification")
+t("ActionRecord→topic_id", rec.topic_id == "hot")
+t("ActionRecord→to_dict", rec.to_dict()["action_type"] == 0)
+
+# IdentityBelief v2
+id2 = IdentityBelief(group_type=GroupType.MAJOR, nickname="小张")
+t("IdentityBelief→group_type", id2.group_type == GroupType.MAJOR)
+t("IdentityBelief→nickname", id2.nickname == "小张")
+
+# build_prompt 接收 Perception 向后兼容（旧接口）
+per = Perception(group_id="g1", group_type=GroupType.CLASS, beta=0.12,
+                  tick=3, topic_heat={"a": 0.5})
+env_dict = {
+    "group_type": per.group_type.name,
+    "beta": per.beta,
+    "role": "ORDINARY",
+    "nickname": "test",
+    "recent_messages": [],
+    "mentions": [],
+    "topic_heat": per.topic_heat,
+    "topic_negative": {},
+    "tick": per.tick,
+}
+p2 = build_prompt(belief, [], env_dict)
+t("build_prompt→Perception 向后兼容", isinstance(p2, str) and len(p2) > 50)
+
+print(f"\n{'='*40}")
+print(f"  通过: {ok}/{ok+fail}")
+print(f"{'='*40}")
+sys.exit(1 if fail else 0)
+
+"""
+多智能体舆情仿真 — Utils 工具函数模块（微信群聊场景 v2）
+E (刘嘉铭) 负责  #30-37
+"""
+
+import json, logging, sys, os, re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import yaml
+from matplotlib import pyplot as plt
+
+try:
+    from sim_types import (SimConfig, ActionType, MessageType,
+                           BeliefSystem, MemoryRecord, Perception)
+except ImportError:
+    SimConfig = ActionType = MessageType = BeliefSystem = MemoryRecord = Perception = None
+
+_LOG = logging.getLogger("utils")
+LOGGER_CACHE: Dict[str, logging.Logger] = {}
+DEFAULT_FIG_SIZE = (14, 8)
+
+# ── 中文字体 ──
+_CN_FONTS = ["PingFang SC", "STHeiti", "Heiti SC", "Microsoft YaHei",
+             "Noto Sans CJK SC", "WenQuanYi Micro Hei"]
+for _f in _CN_FONTS:
+    try:
+        plt.rcParams["font.sans-serif"].insert(0, _f)
+        plt.rcParams["axes.unicode_minus"] = False
+        fig_test, ax_test = plt.subplots(figsize=(0.1, 0.1))
+        ax_test.set_title("测"); fig_test.canvas.draw(); plt.close(fig_test)
+        break
+    except Exception:
+        plt.rcParams["font.sans-serif"].pop(0)
+        continue
+
+
+# ════════════════════════════════════════════
+# #30 load_config
+# ════════════════════════════════════════════
+def load_config(path: str) -> SimConfig:
+    """读取 YAML/JSON 配置文件, 返回 SimConfig。"""
+    _path = Path(path)
+    if not _path.exists():
+        raise FileNotFoundError(f"配置文件不存在: {_path.resolve()}")
+    suffix = _path.suffix.lower()
+    raw = _path.read_text(encoding="utf-8")
+    if suffix in (".yaml", ".yml"):
+        data = yaml.safe_load(raw)
+    elif suffix == ".json":
+        data = json.loads(raw)
+    else:
+        raise ValueError(f"不支持格式: {suffix}")
+    return SimConfig.from_dict(data)
+
+
+# ════════════════════════════════════════════
+# #31 setup_llm_client
+# ════════════════════════════════════════════
+class LLMClient:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self._client = None
+        self._model = config.get("model", "gpt-3.5-turbo")
+        self._base_url = config.get("base_url", "")
+        self._api_key = config.get("api_key", "")
+        self._temperature = config.get("temperature", 0.7)
+        self._max_tokens = config.get("max_tokens", 1024)
+        provider = config.get("provider", "openai")
+        if provider in ("openai", "openai_compatible"):
+            try:
+                from openai import OpenAI
+                self._client = OpenAI(api_key=self._api_key,
+                                      base_url=self._base_url or None)
+            except ImportError:
+                _LOG.warning("openai 未安装, Mock 模式")
+
+    def chat(self, prompt: str) -> str:
+        """调用 LLM，返回 JSON 字符串。"""
+        if self._client is None:
+            # Mock: 默认沉默。调 parse_llm_response 会兜底为 SILENT
+            return ('{"action_type":"SILENT","content":"","topic_id":"","'
+                    '"message_type":"original","target_id":null}')
+        try:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=self._temperature, max_tokens=self._max_tokens)
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            _LOG.error("LLM 失败: %s", e)
+            return ('{"action_type":"SILENT","content":"","topic_id":"",'
+                    '"message_type":"original","target_id":null}')
+
+
+def setup_llm_client(llm_config: Dict[str, Any]) -> LLMClient:
+    """创建 LLM 客户端, 暴露 chat(prompt: str) -> str。"""
+    return LLMClient(llm_config)
+
+
+# ════════════════════════════════════════════
+# #32 build_prompt
+# ════════════════════════════════════════════
+def build_prompt(belief, memory, env_info) -> str:
+    """
+    组装 LLM prompt。
+
+    参数：
+      belief   : BeliefSystem（含身份/心理/观点/情绪）
+      memory   : List[MemoryRecord]
+      env_info : Dict（由 B._update_beliefs 组装，含 group_type、nickname、
+                 recent_messages、mentions、topic_heat、topic_negative 等）
+    """
+    idn, psy, emo = belief.identity, belief.psychology, belief.emotion
+
+    # ── 身份 ──
+    identity_str = (f"昵称: {idn.nickname}\n"
+                    f"角色类型: {idn.agent_type.name}\n"
+                    f"群类型: {idn.group_type.name}\n"
+                    f"角色描述: {idn.role_desc}\n"
+                    f"初始立场: {idn.stance_prior:.2f}\n")
+
+    # ── 心理 ──
+    p = psy.personality
+    psych_str = (f"人格: O={p.openness:.2f} C={p.conscientiousness:.2f} "
+                 f"E={p.extraversion:.2f} A={p.agreeableness:.2f} "
+                 f"N={p.neuroticism:.2f}\n"
+                 f"风险规避: {psy.risk_aversion:.2f}\n")
+
+    # ── 情绪 ──
+    emotion_str = f"情绪: valence={emo.valence:.2f}, arousal={emo.arousal:.2f}\n"
+
+    # ── 观点 ──
+    views = []
+    for tid, ob in belief.opinions.items():
+        views.append(f"  - 话题 {tid}: 立场={ob.opinion_value:.2f}, 置信={ob.confidence:.2f}")
+    opinion_str = "当前观点:\n" + "\n".join(views) if views else "当前观点: (无)"
+
+    # ── 记忆 ──
+    mem_lines = []
+    for rec in memory[-5:]:
+        info = rec.info
+        mem_lines.append(
+            f"  [tick={rec.tick}] {info.source_nickname} "
+            f"[{info.message_type}]: \"{info.content[:60]}\" "
+            f"(负面={info.negative_score:.2f}, 失真={info.distortion_level:.2f})")
+    mem_str = "近期记忆:\n" + "\n".join(mem_lines) if mem_lines else "近期记忆: (空)"
+
+    # ── 环境感知（Dict） ──
+    env_lines = [f"群类型: {env_info.get('group_type', '?')}"]
+    env_lines.append(f"干预系数 β: {env_info.get('beta', 0):.2f}")
+    env_lines.append(f"当前 tick: {env_info.get('tick', 0)}")
+    nick = env_info.get("nickname", "")
+    if nick:
+        env_lines.append(f"你的昵称: {nick}")
+
+    topic_heat = env_info.get("topic_heat", {})
+    if topic_heat:
+        heats = ", ".join(f"{k}(热度={v:.2f})" for k, v in topic_heat.items())
+        env_lines.append(f"话题热度: {heats}")
+
+    topic_neg = env_info.get("topic_negative", {})
+    if topic_neg:
+        negs = ", ".join(f"{k}(负面={v:.2f})" for k, v in topic_neg.items())
+        env_lines.append(f"话题负面程度: {negs}")
+
+    msgs = env_info.get("recent_messages", [])
+    if msgs:
+        env_lines.append("最近消息:")
+        for m in msgs[-5:]:
+            env_lines.append(f"  {m}")
+
+    mentions = env_info.get("mentions", [])
+    if mentions:
+        env_lines.append(f"提到你 ({len(mentions)} 条):")
+        for m in mentions[:3]:
+            env_lines.append(f"  {m}")
+
+    env_str = "环境感知:\n" + "\n".join(env_lines)
+
+    # ── 行动指令 ──
+    action_choices = "SEND_MESSAGE|REPLY|FORWARD|SILENT"
+    msg_choices = "original|forward|paraphrase|exaggerate|clarification"
+
+    return (
+        f"你是在微信群中讨论的普通大学生。请根据你的角色、心理、观点和当前群聊环境决定下一步行动。\n\n"
+        f"### 角色\n{identity_str}\n"
+        f"### 心理\n{psych_str}\n"
+        f"### 情绪\n{emotion_str}\n"
+        f"### {opinion_str}\n\n"
+        f"### {mem_str}\n\n"
+        f"### {env_str}\n\n"
+        f"### 行动指令\n"
+        f"输出 JSON，字段如下：\n"
+        f"  action_type: {action_choices}  (行动类型)\n"
+        f"  content: 你要发送的内容 (字符串)\n"
+        f"  topic_id: 话题标识 (字符串)\n"
+        f"  message_type: {msg_choices}  (消息类型)\n"
+        f"  target_id: 回复目标 agent_id (数字或 null)\n\n"
+        f"只输出 JSON，不要其他文字。\n"
+    )
+
+
+# ════════════════════════════════════════════
+# #33 parse_llm_response
+# ════════════════════════════════════════════
+def parse_llm_response(raw: str) -> Dict[str, Any]:
+    """
+    解析 LLM 响应（v2：支持 message_type、topic_id）。
+
+    解析策略（依次尝试）：
+      1. 纯 JSON
+      2. Markdown ```json 代码块
+      3. 正则提取第一个 {} 对象
+      4. SILENT 兜底
+    """
+    text = raw.strip()
+
+    for strategy in [
+        lambda t: json.loads(t),
+        lambda t: json.loads(m.group(1).strip())
+                   if (m := re.search(r"```(?:json)?\s*\n?(.*?)\n?```", t, re.DOTALL))
+                   else None,
+        lambda t: json.loads(m.group(0))
+                   if (m := re.search(r"\{[^{}]*\}", t)) else None,
+    ]:
+        try:
+            data = strategy(text)
+            if isinstance(data, dict):
+                return _normalize(data)
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            continue
+
+    _LOG.warning("LLM 响应解析失败, SILENT 兜底")
+    return _default()
+
+
+def _normalize(data: dict) -> Dict[str, Any]:
+    """校验并规范化 LLM 输出字段。"""
+    out = _default()
+
+    # action_type
+    at = str(data.get("action_type", "")).upper().strip()
+    try:
+        out["action_type"] = ActionType[at]
+    except KeyError:
+        pass  # 保持 SILENT
+
+    if "content" in data:
+        out["content"] = str(data["content"])
+
+    if "topic_id" in data:
+        out["topic_id"] = str(data["topic_id"])
+
+    # message_type
+    mt = str(data.get("message_type", "")).strip().lower()
+    valid_types = {"original", "forward", "paraphrase", "exaggerate", "clarification"}
+    if mt in valid_types:
+        out["message_type"] = mt
+
+    if data.get("target_id") is not None:
+        out["target_id"] = int(data["target_id"])
+
+    return out
+
+
+def _default() -> Dict[str, Any]:
+    return {
+        "action_type": ActionType.SILENT,
+        "content": "",
+        "topic_id": "",
+        "message_type": "original",
+        "target_id": None,
+    }
+
+
+# ════════════════════════════════════════════
+# #34 save_simulation_results
+# ════════════════════════════════════════════
+_FLOAT_TO_INT16 = 32767
+_FLOAT_TO_UINT16 = 65535
+# 指标列 → 值域映射
+_M11 = {"avg_opinion", "polarization", "emotional_contagion", "topic_heat"}
+_M01 = {"participation_rate", "negative_score", "distortion_level",
+        "confidence", "arousal"}
+
+
+def _encode(col_name, value):
+    if col_name in _M11:
+        return int(round(np.clip(value, -1, 1) * _FLOAT_TO_INT16))
+    if col_name in _M01:
+        return int(round(np.clip(value, 0, 1) * _FLOAT_TO_UINT16))
+    return value
+
+
+def save_simulation_results(data: pd.DataFrame, path: str, fmt="csv") -> str:
+    """
+    保存仿真结果（v2：新增 topic_heat、negative_score 等列编码）。
+
+    16bit 编码规则：
+      [-1, 1] → int16  (×32767)
+      [0, 1]  → uint16  (×65535)
+    """
+    fmt = fmt.lower()
+    if fmt not in ("csv", "json"):
+        raise ValueError(f"不支持格式: {fmt}")
+    out = data.copy()
+    for col in out.columns:
+        if col in _M11 or col in _M01:
+            out[col] = out[col].apply(lambda v: _encode(col, v))
+    out_path = Path(path).with_suffix(f".{fmt}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "csv":
+        out.to_csv(out_path, index=False, encoding="utf-8")
+    else:
+        out.to_json(out_path, orient="records", force_ascii=False, indent=2)
+    return str(out_path.resolve())
+
+
+# ════════════════════════════════════════════
+# #35 visualize_trend
+# ════════════════════════════════════════════
+def visualize_trend(data, metrics, out_path, title=None):
+    if "tick" not in data.columns:
+        raise KeyError("data 必须有 tick 列")
+    missing = [c for c in metrics if c not in data.columns]
+    if missing:
+        raise KeyError(f"缺少列: {missing}")
+
+    has_label = "experiment_label" in data.columns
+    n = len(metrics)
+    fig, axes = plt.subplots(n, 1, figsize=DEFAULT_FIG_SIZE, sharex=True, squeeze=False)
+    axes = axes[:, 0]
+
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        if has_label:
+            for lbl, grp in data.groupby("experiment_label"):
+                grp_s = grp.sort_values("tick")
+                ax.plot(grp_s["tick"], grp_s[metric], label=str(lbl), linewidth=1.5)
+            ax.legend(fontsize=9)
+        else:
+            df_s = data.sort_values("tick")
+            ax.plot(df_s["tick"], df_s[metric], color="#1f77b4", linewidth=1.5)
+        ax.set_ylabel(metric, fontsize=11)
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("tick", fontsize=11)
+    fig.suptitle(title or "仿真指标趋势", fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    out = Path(out_path).with_suffix(".png")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return str(out.resolve())
+
+
+# ════════════════════════════════════════════
+# #36 compute_similarity
+# ════════════════════════════════════════════
+def compute_similarity(text_a, text_b):
+    try:
+        from sentence_transformers import SentenceTransformer, util
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+        ea = model.encode(text_a, convert_to_tensor=True)
+        eb = model.encode(text_b, convert_to_tensor=True)
+        return max(0.0, min(1.0, (float(util.pytorch_cos_sim(ea, eb).item()) + 1) / 2))
+    except ImportError:
+        ta = set(re.findall(r"\w+", text_a.lower()))
+        tb = set(re.findall(r"\w+", text_b.lower()))
+        if not ta and not tb: return 1.0
+        if not ta or not tb: return 0.0
+        return len(ta & tb) / len(ta | tb)
+
+
+# ════════════════════════════════════════════
+# #37 get_logger
+# ════════════════════════════════════════════
+def get_logger(name: str, level="INFO"):
+    if name in LOGGER_CACHE:
+        return LOGGER_CACHE[name]
+    log = logging.getLogger(name)
+    log.setLevel(getattr(logging, level.upper(), logging.INFO))
+    if not log.handlers:
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(name)-24s %(levelname)-8s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"))
+        log.addHandler(h)
+    log.propagate = False
+    LOGGER_CACHE[name] = log
+    return log
