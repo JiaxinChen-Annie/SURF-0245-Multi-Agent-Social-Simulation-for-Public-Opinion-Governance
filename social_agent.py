@@ -20,6 +20,11 @@ social_agent.py — 智能体层（接口表 #1–11）
   - 降级路径：原 Deffuant-Weisbuch 有界置信度规则，逻辑不变
   - _llm_client 为 None（config.llm_config 为空）时仅走规则存根
 
+【转发行为修复】
+  - 所有角色按差异化概率生成 share，不再只允许 ACTIVE 转发
+  - share 必须绑定一条真实可见消息，target_id 记录原消息作者
+  - 转发内容保留来源标识，供 A 模块识别实际跨群 FORWARD
+
 B 同学 S2 阶段用真实 LLM 版本替换 _update_beliefs 即可。
 """
 
@@ -61,6 +66,23 @@ _LEARNING_RATE: Dict[AgentType, float] = {
     AgentType.RATIONAL:   0.03,
     AgentType.CONTROLLER: 0.01,
 }
+
+# 各角色在“看见可转发消息”后的基础转发概率。
+# ACTIVE 仍最积极，但其他角色也不再被硬性排除。
+_SHARE_PROBABILITY: Dict[AgentType, float] = {
+    AgentType.ORDINARY:   0.05,
+    AgentType.ACTIVE:     0.30,
+    AgentType.RATIONAL:   0.10,
+    AgentType.CONTROLLER: 0.05,
+}
+
+_SHARE_PRIORITY: Dict[AgentType, float] = {
+    AgentType.ORDINARY:   0.55,
+    AgentType.ACTIVE:     0.75,
+    AgentType.RATIONAL:   0.60,
+    AgentType.CONTROLLER: 0.50,
+}
+
 _MEMORY_CAPACITY = 20   # 短期记忆最大条数
 
 # ─── C 模块懒加载（避免无 llm_utils 时整体崩溃）───────────────────────────── #
@@ -440,16 +462,29 @@ class SocialAgent(Agent):
             if avg_distortion > 0.5:
                 desires.append(Desire("clarify", priority=0.75, topic_id=topic_id))
 
-        # 高唤醒情绪欲望
-        if e.arousal > 0.65:
-            if e.valence < -0.2:
-                desires.append(Desire("discuss", priority=0.7, topic_id=topic_id))
-            else:
-                desires.append(Desire("share", priority=0.65, topic_id=topic_id))
+        # 高唤醒且负面：优先讨论；正面高唤醒会提高后续转发优先级。
+        if e.arousal > 0.65 and e.valence < -0.2:
+            desires.append(Desire("discuss", priority=0.7, topic_id=topic_id))
 
-        # ACTIVE：偏好转发
-        if agent_type == AgentType.ACTIVE:
-            desires.append(Desire("share", priority=0.6, topic_id=topic_id))
+        # 转发欲望：所有角色均有概率产生，但必须绑定一条真实可见消息。
+        # target_id 记录被转发消息的原作者；是否跨群由 A 模块根据两者
+        # group_type 判定，不在这里人为偏向异群来源。
+        forward_source = self._select_forward_source()
+        if forward_source is not None:
+            share_priority: Optional[float] = None
+            if self.model.random.random() < _SHARE_PROBABILITY[agent_type]:
+                share_priority = _SHARE_PRIORITY[agent_type]
+
+            if e.arousal > 0.65 and e.valence >= -0.2:
+                share_priority = max(share_priority or 0.0, 0.65)
+
+            if share_priority is not None:
+                desires.append(Desire(
+                    "share",
+                    priority=share_priority,
+                    topic_id=forward_source.topic_id or topic_id,
+                    target_id=forward_source.source_id,
+                ))
 
         # 背景欲望（所有角色）
         desires.append(Desire("discuss",  priority=0.35, topic_id=topic_id))
@@ -495,10 +530,38 @@ class SocialAgent(Agent):
         stance  = "支持" if op_val > 0.1 else ("反对" if op_val < -0.1 else "观望")
         role    = self.beliefs.identity.agent_type.name
         group   = self.beliefs.identity.group_type.name
-        content = (
-            f"[{group}/{role}] Agent-{self.unique_id}({self.beliefs.identity.nickname}) "
-            f"对话题{primary.topic_id}表示{stance}"
-        )
+
+        if action_type == ActionType.FORWARD and primary.target_id is not None:
+            source_info = None
+            if self._last_perception is not None:
+                source_info = next(
+                    (
+                        si for si in self._last_perception.recent_messages
+                        if si.source_id == primary.target_id
+                    ),
+                    None,
+                )
+            source_label = (
+                source_info.source_nickname
+                if source_info is not None and source_info.source_nickname
+                else f"Agent-{primary.target_id}"
+            )
+            source_text = (
+                source_info.content.strip()
+                if source_info is not None and source_info.content.strip()
+                else f"关于话题{primary.topic_id}的消息"
+            )
+            if len(source_text) > 100:
+                source_text = source_text[:97] + "..."
+            content = (
+                f"[{group}/{role}] {self.beliefs.identity.nickname} "
+                f"转发自{source_label}：{source_text}"
+            )
+        else:
+            content = (
+                f"[{group}/{role}] Agent-{self.unique_id}({self.beliefs.identity.nickname}) "
+                f"对话题{primary.topic_id}表示{stance}"
+            )
 
         return Intention(
             action_type=action_type,
@@ -684,6 +747,27 @@ class SocialAgent(Agent):
     # ------------------------------------------------------------------ #
     #  内部辅助                                                            #
     # ------------------------------------------------------------------ #
+    def _select_forward_source(self) -> Optional[SocialInfo]:
+        """
+        从本次感知中选择一条可转发消息。
+
+        从最近 5 条可见消息中随机选择；异群消息进入候选池的概率由 A 模块
+        cross_group_visibility 控制，因此这里不额外放大跨群转发比例。
+        返回值的 source_id 会写入 FORWARD ActionRecord.target_id。
+        """
+        if self._last_perception is None:
+            return None
+
+        candidates = [
+            si for si in self._last_perception.recent_messages
+            if si.source_id != self.unique_id and bool(si.content.strip())
+        ]
+        if not candidates:
+            return None
+
+        # recent_messages 已按“从新到旧”排序；限制在前 5 条兼顾最近性与多样性。
+        return self.model.random.choice(candidates[:5])
+
     def _get_primary_opinion_value(self) -> float:
         """返回第一个话题的观点值，默认 0.0。"""
         if self.beliefs.opinions:

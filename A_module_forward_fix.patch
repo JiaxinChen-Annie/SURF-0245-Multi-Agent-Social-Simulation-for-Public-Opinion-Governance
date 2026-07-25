@@ -1,0 +1,864 @@
+--- a/opinion_model.py
++++ b/opinion_model.py
+@@ -22,6 +22,12 @@
+   - intervention_tick 由本模块统一维护（B 模块写的为参考值，A 为权威）
+   - 所有 event_id → topic_id，枚举对齐新版
+ 
++【转发行为修复】
++  - 同群消息始终可见，异群消息按 cross_group_visibility 概率进入感知流
++  - cross_group_forward 只统计 Agent 实际执行的跨群 FORWARD
++  - 宏观热度扩散单独统计为 cross_group_spread，不再污染转发指标
++  - 热度衰减按群选择对应 B Agent，避免用第一个 Agent 的 β 计算所有群
++
+ 【W4 LLM 接入变更】
+   - __init__ 新增 ⑤-b：读取 config.llm_config，调用 C 模块 setup_llm_client
+     初始化 self._llm_client，挂载到模型实例供所有 SocialAgent 通过
+@@ -57,12 +63,20 @@
+ 
+ from types_def import (
+     SimConfig, AgentType, GroupType, ActionRecord, ActionType,
+-    MessageType, EmotionState, ALPHA, THETA, GROUP_BETA,
++    EmotionState, ALPHA, THETA, GROUP_BETA,
+ )
+ 
+ _LOG = logging.getLogger("OpinionModel")
+ 
+ 
++def _as_probability(value: Any, default: float) -> float:
++    """把配置值安全转换到 [0, 1]；非法值回退到 default。"""
++    try:
++        return float(np.clip(float(value), 0.0, 1.0))
++    except (TypeError, ValueError):
++        return default
++
++
+ class OpinionModel(Model):
+     """
+     多智能体舆情仿真 · 模型/环境层（A 模块）。
+@@ -75,6 +89,9 @@
+     供所有 SocialAgent 通过 self.model._llm_client 访问。
+     """
+ 
++    DEFAULT_CROSS_GROUP_VISIBILITY = 0.10
++    DEFAULT_CROSS_GROUP_SPREAD_PROBABILITY = 0.15
++
+     # ================================================================== #
+     #  #12  __init__                                                       #
+     # ================================================================== #
+@@ -90,6 +107,23 @@
+         super().__init__()
+         self.config = config
+ 
++        # 跨群行为参数。沿用 network_params 承载，避免破坏 SimConfig 接口。
++        network_params = config.network_params or {}
++        self.cross_group_visibility = _as_probability(
++            network_params.get(
++                "cross_group_visibility",
++                self.DEFAULT_CROSS_GROUP_VISIBILITY,
++            ),
++            self.DEFAULT_CROSS_GROUP_VISIBILITY,
++        )
++        self.cross_group_spread_probability = _as_probability(
++            network_params.get(
++                "cross_group_spread_probability",
++                self.DEFAULT_CROSS_GROUP_SPREAD_PROBABILITY,
++            ),
++            self.DEFAULT_CROSS_GROUP_SPREAD_PROBABILITY,
++        )
++
+         # ① 固定随机种子
+         self.random.seed(config.random_seed)
+         np.random.seed(config.random_seed)
+@@ -126,9 +160,12 @@
+             GroupType.CAMPUS: None,
+         }
+ 
+-        #    cross_group_forward: 跨群转发次数统计
++        #    cross_group_forward: Agent 实际跨群转发次数（微观行为）
+         self.cross_group_forward: int = 0
+ 
++        #    cross_group_spread: 热度跨群传播次数（宏观环境机制）
++        self.cross_group_spread: int = 0
++
+         #    情绪快照（供 _calc_emotional_contagion 使用）
+         self._prev_emotion_snapshot: Dict[int, EmotionState] = {}
+ 
+@@ -178,7 +215,8 @@
+         # ⑥ DataCollector（E 模块从此处读取输出）
+         #    指标对齐接口表§5：message_count / avg_opinion / polarization /
+         #    negative_emotion / distortion_level / cross_group_forward /
+-        #    intervention_tick / recovery_time
++        #    intervention_tick / recovery_time；另扩展 cross_group_spread，
++        #    用于与 Agent 实际转发严格区分。
+         self.datacollector = DataCollector(
+             model_reporters={
+                 "avg_opinion":          lambda m: m._calc_avg_opinion(),
+@@ -188,6 +226,7 @@
+                 "negative_emotion":     lambda m: m._calc_negative_emotion(),
+                 "distortion_level":     lambda m: m._calc_avg_distortion(),
+                 "cross_group_forward":  lambda m: m.cross_group_forward,
++                "cross_group_spread":   lambda m: m.cross_group_spread,
+                 "intervention_tick":    lambda m: m._get_earliest_intervention_tick(),
+                 "recovery_time":        lambda m: m._calc_recovery_time(),
+             }
+@@ -207,6 +246,7 @@
+             f"OpinionModel 初始化完成 | "
+             f"n_agents={config.n_agents} | "
+             f"network={config.network_type} | "
++            f"cross_visibility={self.cross_group_visibility:.2f} | "
+             f"llm={'已接入' if self._llm_client is not None else '规则存根'} | "
+             f"mesa={'系统' if _MESA_REAL else '垫片'}"
+         )
+@@ -410,27 +450,40 @@
+         """
+         current_tick = int(self.schedule.time)
+         EXPIRE_TICKS = 10
+-        SPREAD_PROB  = 0.15   # 跨群扩散概率（每步每个热话题）
+ 
+         # ── ① 尝试获取 B 模块的 calc_heat_decay ──────────────────────
+-        # B 模块将 calc_heat_decay 定义在 SocialAgent 上，
+-        # A 模块通过取第一个 agent 实例来调用（若存在）。
++        # B 模块将 calc_heat_decay 定义在 SocialAgent 上，且函数内部使用
++        # agent 自身的 group_type / beta。因此必须按群选择对应 Agent，不能
++        # 用第一个 Agent 代算所有群；某群无 Agent 时使用 A 的纯函数降级。
+         _agents_list = list(self.schedule.agents)  # Mesa 3.x AgentSet 需转 list 才能索引
+-        _b_agent = _agents_list[0] if _agents_list else None
+-        _has_b_decay = _b_agent is not None and hasattr(_b_agent, "calc_heat_decay")
++        _decay_agents: Dict[GroupType, Any] = {}
++        for _agent in _agents_list:
++            if not hasattr(_agent, "calc_heat_decay"):
++                continue
++            try:
++                _agent_group = _agent.beliefs.identity.group_type
++            except (AttributeError, TypeError):
++                continue
++            _decay_agents.setdefault(_agent_group, _agent)
+ 
+         def _heat_decay(current_heat: float, group_type: GroupType) -> float:
+             """调用 B 模块 calc_heat_decay 或本地降级。"""
+             elapsed = current_tick  # elapsed_steps 即当前 tick
+             t_int   = self.intervention_tick.get(group_type, None)
+-            if _has_b_decay:
+-                return _b_agent.calc_heat_decay(
+-                    current_heat=current_heat,
+-                    elapsed_steps=elapsed,
+-                    intervention_tick=t_int,
+-                )
+-            else:
+-                return self._fallback_heat_decay(current_heat, group_type, elapsed, t_int)
++            decay_agent = _decay_agents.get(group_type)
++            if decay_agent is not None:
++                try:
++                    return float(decay_agent.calc_heat_decay(
++                        current_heat=current_heat,
++                        elapsed_steps=elapsed,
++                        intervention_tick=t_int,
++                    ))
++                except Exception as exc:
++                    _LOG.debug(
++                        f"{group_type.name} 群调用 B.calc_heat_decay 失败，"
++                        f"改用 A 降级公式: {exc}"
++                    )
++            return self._fallback_heat_decay(current_heat, group_type, elapsed, t_int)
+ 
+         # ── ② 更新各话题各群热度 ──────────────────────────────────────
+         #    同时检测 intervention_tick 触发条件
+@@ -439,7 +492,6 @@
+         for topic_id, group_heat in self.topic_heat.items():
+             for group_type in GroupType:
+                 old_heat = group_heat[group_type]
+-                new_heat = _heat_decay(old_heat, group_type)
+ 
+                 # 检测 CONTROLLER 干预触发（H(t) ≥ θ，该群有 CONTROLLER，且未记录）
+                 if (group_type != GroupType.DORM
+@@ -452,6 +504,9 @@
+                         f"H={old_heat:.3f} ≥ θ={THETA}"
+                     )
+ 
++                # 触发时先写入 intervention_tick，再计算 H(t+1)，从而严格满足
++                # 公式中的 𝟙[t ≥ t_k^int]，避免干预效果晚一 tick 生效。
++                new_heat = _heat_decay(old_heat, group_type)
+                 group_heat[group_type] = max(0.0, new_heat)
+ 
+             # ── ③ 跨群扩散 ────────────────────────────────────────────
+@@ -459,16 +514,16 @@
+                 if group_heat[src_gt] >= THETA:
+                     for dst_gt in GroupType:
+                         if dst_gt != src_gt:
+-                            if self.random.random() < SPREAD_PROB:
++                            if self.random.random() < self.cross_group_spread_probability:
+                                 # 热度传播（取较小值叠加，避免无限膨胀）
+                                 spread_amount = group_heat[src_gt] * 0.1
+                                 group_heat[dst_gt] = min(
+                                     group_heat[dst_gt] + spread_amount,
+                                     group_heat[src_gt],
+                                 )
+-                                self.cross_group_forward += 1
++                                self.cross_group_spread += 1
+                                 _LOG.debug(
+-                                    f"[tick={current_tick}] 跨群扩散 "
++                                    f"[tick={current_tick}] 热度跨群扩散 "
+                                     f"{src_gt.name}→{dst_gt.name} "
+                                     f"topic={topic_id} +{spread_amount:.3f}"
+                                 )
+@@ -574,7 +629,8 @@
+         W4 新增：
+           - 处理 record.heat / record.negative_score / record.message_type
+           - 若 source 与 target 属不同群，cross_group_forward 计数 +1
+-            （此处基于 message_type=FORWARD 且有 target_id 时判断）
++            （此处基于 action_type=FORWARD 且有 target_id 时判断；
++             FORWARD 的 target_id 表示被转发消息的原作者）
+ 
+         Parameters
+         ----------
+@@ -612,8 +668,10 @@
+             (1 - SMOOTH) * old_neg + SMOOTH * record.negative_score
+         )
+ 
+-        # ⑥ 跨群转发判断：FORWARD 类型 + 有 target_id → 检查目标所在群
+-        if (record.message_type == MessageType.FORWARD
++        # ⑥ 跨群转发判断：FORWARD 行动 + 有来源作者 → 检查两者所在群
++        # 使用 action_type，而非 message_type：RATIONAL/ORDINARY 的转发可能
++        # 以 PARAPHRASE 表达，但仍是一次真实的 FORWARD 行为。
++        if (record.action_type == ActionType.FORWARD
+                 and record.target_id is not None):
+             tgt_agent = self._get_agent_by_id(record.target_id)
+             if tgt_agent and hasattr(tgt_agent, "beliefs"):
+@@ -647,16 +705,35 @@
+         return GroupType.CLASS
+ 
+     def get_group_messages(self, agent_id: int, limit: int = 20) -> List[ActionRecord]:
+-        """返回与 agent 同群的最近消息（供 B 模块 _perceive 使用）。"""
++        """
++        返回 Agent 可见的最近消息。
++
++        - 同群消息始终可见；
++        - 异群消息以 ``cross_group_visibility`` 概率可见，模拟从其他群
++          截图、转述或转发进入当前群的信息；
++        - 返回顺序仍为从新到旧，最多 ``limit`` 条。
++        """
++        if limit <= 0:
++            return []
++
+         src_group = self.get_group_type(agent_id)
+-        result = []
++        result: List[ActionRecord] = []
+         for record in reversed(self.info_stream_cache):
+             rec_agent = self._get_agent_by_id(record.agent_id)
+-            if rec_agent and hasattr(rec_agent, "beliefs"):
+-                if rec_agent.beliefs.identity.group_type == src_group:
+-                    result.append(record)
+-                    if len(result) >= limit:
+-                        break
++            if not rec_agent or not hasattr(rec_agent, "beliefs"):
++                continue
++
++            rec_group = rec_agent.beliefs.identity.group_type
++            visible = rec_group == src_group
++            if (not visible
++                    and self.cross_group_visibility > 0.0
++                    and self.random.random() < self.cross_group_visibility):
++                visible = True
++
++            if visible:
++                result.append(record)
++                if len(result) >= limit:
++                    break
+         return result
+ 
+     def get_topic_heat(self) -> Dict[str, float]:
+--- a/social_agent.py
++++ b/social_agent.py
+@@ -20,6 +20,11 @@
+   - 降级路径：原 Deffuant-Weisbuch 有界置信度规则，逻辑不变
+   - _llm_client 为 None（config.llm_config 为空）时仅走规则存根
+ 
++【转发行为修复】
++  - 所有角色按差异化概率生成 share，不再只允许 ACTIVE 转发
++  - share 必须绑定一条真实可见消息，target_id 记录原消息作者
++  - 转发内容保留来源标识，供 A 模块识别实际跨群 FORWARD
++
+ B 同学 S2 阶段用真实 LLM 版本替换 _update_beliefs 即可。
+ """
+ 
+@@ -61,6 +66,23 @@
+     AgentType.RATIONAL:   0.03,
+     AgentType.CONTROLLER: 0.01,
+ }
++
++# 各角色在“看见可转发消息”后的基础转发概率。
++# ACTIVE 仍最积极，但其他角色也不再被硬性排除。
++_SHARE_PROBABILITY: Dict[AgentType, float] = {
++    AgentType.ORDINARY:   0.05,
++    AgentType.ACTIVE:     0.30,
++    AgentType.RATIONAL:   0.10,
++    AgentType.CONTROLLER: 0.05,
++}
++
++_SHARE_PRIORITY: Dict[AgentType, float] = {
++    AgentType.ORDINARY:   0.55,
++    AgentType.ACTIVE:     0.75,
++    AgentType.RATIONAL:   0.60,
++    AgentType.CONTROLLER: 0.50,
++}
++
+ _MEMORY_CAPACITY = 20   # 短期记忆最大条数
+ 
+ # ─── C 模块懒加载（避免无 llm_utils 时整体崩溃）───────────────────────────── #
+@@ -440,16 +462,29 @@
+             if avg_distortion > 0.5:
+                 desires.append(Desire("clarify", priority=0.75, topic_id=topic_id))
+ 
+-        # 高唤醒情绪欲望
+-        if e.arousal > 0.65:
+-            if e.valence < -0.2:
+-                desires.append(Desire("discuss", priority=0.7, topic_id=topic_id))
+-            else:
+-                desires.append(Desire("share", priority=0.65, topic_id=topic_id))
+-
+-        # ACTIVE：偏好转发
+-        if agent_type == AgentType.ACTIVE:
+-            desires.append(Desire("share", priority=0.6, topic_id=topic_id))
++        # 高唤醒且负面：优先讨论；正面高唤醒会提高后续转发优先级。
++        if e.arousal > 0.65 and e.valence < -0.2:
++            desires.append(Desire("discuss", priority=0.7, topic_id=topic_id))
++
++        # 转发欲望：所有角色均有概率产生，但必须绑定一条真实可见消息。
++        # target_id 记录被转发消息的原作者；是否跨群由 A 模块根据两者
++        # group_type 判定，不在这里人为偏向异群来源。
++        forward_source = self._select_forward_source()
++        if forward_source is not None:
++            share_priority: Optional[float] = None
++            if self.model.random.random() < _SHARE_PROBABILITY[agent_type]:
++                share_priority = _SHARE_PRIORITY[agent_type]
++
++            if e.arousal > 0.65 and e.valence >= -0.2:
++                share_priority = max(share_priority or 0.0, 0.65)
++
++            if share_priority is not None:
++                desires.append(Desire(
++                    "share",
++                    priority=share_priority,
++                    topic_id=forward_source.topic_id or topic_id,
++                    target_id=forward_source.source_id,
++                ))
+ 
+         # 背景欲望（所有角色）
+         desires.append(Desire("discuss",  priority=0.35, topic_id=topic_id))
+@@ -495,10 +530,38 @@
+         stance  = "支持" if op_val > 0.1 else ("反对" if op_val < -0.1 else "观望")
+         role    = self.beliefs.identity.agent_type.name
+         group   = self.beliefs.identity.group_type.name
+-        content = (
+-            f"[{group}/{role}] Agent-{self.unique_id}({self.beliefs.identity.nickname}) "
+-            f"对话题{primary.topic_id}表示{stance}"
+-        )
++
++        if action_type == ActionType.FORWARD and primary.target_id is not None:
++            source_info = None
++            if self._last_perception is not None:
++                source_info = next(
++                    (
++                        si for si in self._last_perception.recent_messages
++                        if si.source_id == primary.target_id
++                    ),
++                    None,
++                )
++            source_label = (
++                source_info.source_nickname
++                if source_info is not None and source_info.source_nickname
++                else f"Agent-{primary.target_id}"
++            )
++            source_text = (
++                source_info.content.strip()
++                if source_info is not None and source_info.content.strip()
++                else f"关于话题{primary.topic_id}的消息"
++            )
++            if len(source_text) > 100:
++                source_text = source_text[:97] + "..."
++            content = (
++                f"[{group}/{role}] {self.beliefs.identity.nickname} "
++                f"转发自{source_label}：{source_text}"
++            )
++        else:
++            content = (
++                f"[{group}/{role}] Agent-{self.unique_id}({self.beliefs.identity.nickname}) "
++                f"对话题{primary.topic_id}表示{stance}"
++            )
+ 
+         return Intention(
+             action_type=action_type,
+@@ -684,6 +747,27 @@
+     # ------------------------------------------------------------------ #
+     #  内部辅助                                                            #
+     # ------------------------------------------------------------------ #
++    def _select_forward_source(self) -> Optional[SocialInfo]:
++        """
++        从本次感知中选择一条可转发消息。
++
++        从最近 5 条可见消息中随机选择；异群消息进入候选池的概率由 A 模块
++        cross_group_visibility 控制，因此这里不额外放大跨群转发比例。
++        返回值的 source_id 会写入 FORWARD ActionRecord.target_id。
++        """
++        if self._last_perception is None:
++            return None
++
++        candidates = [
++            si for si in self._last_perception.recent_messages
++            if si.source_id != self.unique_id and bool(si.content.strip())
++        ]
++        if not candidates:
++            return None
++
++        # recent_messages 已按“从新到旧”排序；限制在前 5 条兼顾最近性与多样性。
++        return self.model.random.choice(candidates[:5])
++
+     def _get_primary_opinion_value(self) -> float:
+         """返回第一个话题的观点值，默认 0.0。"""
+         if self.beliefs.opinions:
+--- a/test_contract.py
++++ b/test_contract.py
+@@ -11,6 +11,8 @@
+   - SocialAgent.__init__ 新增 group_type 参数验证
+   - calc_heat_decay 接口验证（#11）
+   - Perception 新增字段检查
++  - 跨群可见、FORWARD target_id、微观/宏观计数分离回归测试
++  - 各群 β 与干预触发 tick 的热度公式回归测试
+ 
+ 用法：python3 test_contract.py
+ """
+@@ -296,7 +298,8 @@
+     required = {
+         "avg_opinion", "polarization", "emotional_contagion",
+         "message_count", "negative_emotion", "distortion_level",
+-        "cross_group_forward", "intervention_tick", "recovery_time",
++        "cross_group_forward", "cross_group_spread",
++        "intervention_tick", "recovery_time",
+     }
+     missing = required - set(df.columns)
+     assert not missing, f"缺少必需列：{missing}"
+@@ -308,18 +311,28 @@
+ 
+ 
+ def _test_model_submit_action_v2():
+-    """submit_action 更新 topic_heat / topic_negative / cross_group_forward。"""
+-    from types_def import SimConfig, ActionRecord, ActionType, MessageType
++    """submit_action 更新热度，并按 ActionType 统计真实跨群转发。"""
++    from types_def import (
++        SimConfig, ActionRecord, ActionType, MessageType,
++        GroupType, GROUP_BETA,
++    )
+     from opinion_model import OpinionModel
+     model = OpinionModel(SimConfig(
+         n_agents=2,
+         hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+     ))
++    agents = list(model.schedule.agents)
++    src_agent, origin_agent = agents[0], agents[1]
++    src_agent.beliefs.identity.group_type = GroupType.CLASS
++    src_agent.beta = GROUP_BETA[GroupType.CLASS]
++    origin_agent.beliefs.identity.group_type = GroupType.DORM
++    origin_agent.beta = GROUP_BETA[GroupType.DORM]
++
+     before_cache = len(model.info_stream_cache)
+     before_fwd   = model.cross_group_forward
+ 
+     r = ActionRecord(
+-        agent_id=0,
++        agent_id=src_agent.unique_id,
+         action_type=ActionType.SEND_MESSAGE,
+         content="测试消息",
+         topic_id="T001",          # v2：topic_id 而非 event_id
+@@ -336,10 +349,88 @@
+     assert "T001" in model.topic_negative, "topic_negative 应含 T001"
+ 
+     # heat 已更新（大于初始 0.0）
+-    from types_def import GroupType
+     total_heat = sum(model.topic_heat["T001"].values())
+     assert total_heat > 0.0, "submit_action 后 topic_heat 应增加"
+ 
++    # 非 ACTIVE 角色也可能用 PARAPHRASE 表达转发，因此必须看 action_type。
++    fwd = ActionRecord(
++        agent_id=src_agent.unique_id,
++        action_type=ActionType.FORWARD,
++        content="转述异群消息",
++        target_id=origin_agent.unique_id,
++        topic_id="T001",
++        distortion_level=0.25,
++        message_type=MessageType.PARAPHRASE,
++        negative_score=0.2,
++        heat=0.2,
++        tick=0,
++    )
++    model.submit_action(fwd)
++    assert model.cross_group_forward == before_fwd + 1, \
++        "真实跨群 FORWARD 应计数，不能依赖 message_type=forward"
++
++
++def _test_cross_group_visibility_and_forward_target():
++    """异群消息可见后，Agent 的 share 必须绑定原作者并形成实际跨群转发。"""
++    from types_def import (
++        SimConfig, AgentType, GroupType, GROUP_BETA,
++        ActionRecord, ActionType, MessageType,
++    )
++    from opinion_model import OpinionModel
++
++    model = OpinionModel(SimConfig(
++        n_agents=2,
++        network_params={"m": 1, "cross_group_visibility": 1.0},
++        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
++    ))
++    viewer, origin = list(model.schedule.agents)
++    viewer.beliefs.identity.agent_type = AgentType.ACTIVE
++    viewer.beliefs.identity.group_type = GroupType.CLASS
++    viewer.beta = GROUP_BETA[GroupType.CLASS]
++    origin.beliefs.identity.agent_type = AgentType.ORDINARY
++    origin.beliefs.identity.group_type = GroupType.DORM
++    origin.beta = GROUP_BETA[GroupType.DORM]
++
++    source_record = ActionRecord(
++        agent_id=origin.unique_id,
++        action_type=ActionType.SEND_MESSAGE,
++        content="宿舍群里的原始消息",
++        topic_id="T001",
++        message_type=MessageType.ORIGINAL,
++        heat=0.2,
++        tick=0,
++    )
++    model.submit_action(source_record)
++
++    perception = viewer._perceive()
++    assert any(si.source_id == origin.unique_id for si in perception.recent_messages), \
++        "cross_group_visibility=1 时必须看到异群消息"
++
++    viewer._last_perception = perception
++    viewer.beliefs.emotion.arousal = 0.5
++    viewer.beliefs.emotion.valence = 0.0
++    viewer.beliefs.psychology.personality.extraversion = 1.0
++    viewer.beliefs.psychology.risk_aversion = 0.0
++
++    original_random = model.random.random
++    model.random.random = lambda: 0.0  # 强制触发 share 与行动
++    try:
++        desires = viewer._infer_desires()
++        share = next((d for d in desires if d.goal_type == "share"), None)
++        assert share is not None, "ACTIVE 在概率命中时应产生 share 欲望"
++        assert share.target_id == origin.unique_id, "share.target_id 应指向原消息作者"
++
++        intention = viewer._plan_intentions(desires)
++        assert intention.action_type == ActionType.FORWARD
++        assert intention.target_id == origin.unique_id
++
++        before = model.cross_group_forward
++        viewer._execute_action(intention)
++        assert model.cross_group_forward == before + 1, \
++            "执行后应形成一条可追踪的实际跨群转发"
++    finally:
++        model.random.random = original_random
++
+ 
+ def _test_model_update_environment():
+     """_update_environment 调用后热度应衰减，且不为负。"""
+@@ -358,6 +449,83 @@
+     assert new_heat >= 0.0, "热度不应为负"
+ 
+ 
++def _test_group_specific_heat_decay():
++    """每个群必须使用自己的 β；干预后 CAMPUS 衰减最快。"""
++    from types_def import SimConfig, GroupType
++    from opinion_model import OpinionModel
++
++    model = OpinionModel(SimConfig(
++        n_agents=20,
++        network_params={"m": 1, "cross_group_spread_probability": 0.0},
++        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
++        random_seed=42,
++    ))
++    model.cross_group_spread_probability = 0.0
++    for group_type in GroupType:
++        model.topic_heat["T001"][group_type] = 0.6  # 低于 THETA，避免新触发逻辑干扰
++    model.intervention_tick[GroupType.DORM] = None
++    model.intervention_tick[GroupType.CLASS] = 0
++    model.intervention_tick[GroupType.MAJOR] = 0
++    model.intervention_tick[GroupType.CAMPUS] = 0
++    model.schedule.time = 1
++
++    model._update_environment()
++    h = model.topic_heat["T001"]
++    assert h[GroupType.DORM] > h[GroupType.CLASS] > h[GroupType.MAJOR] > h[GroupType.CAMPUS], \
++        f"群别 β 未生效：{ {g.name: h[g] for g in GroupType} }"
++
++
++def _test_intervention_applies_same_tick():
++    """H(t) 达阈值时，干预项应立即参与 H(t+1) 计算。"""
++    import math
++    from types_def import SimConfig, AgentType, GroupType, ALPHA, GROUP_BETA
++    from opinion_model import OpinionModel
++
++    model = OpinionModel(SimConfig(
++        n_agents=20,
++        network_params={"m": 1, "cross_group_spread_probability": 0.0},
++        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
++        random_seed=42,
++    ))
++    model.cross_group_spread_probability = 0.0
++
++    controller = list(model.schedule.agents)[0]
++    controller.beliefs.identity.agent_type = AgentType.CONTROLLER
++    controller.beliefs.identity.group_type = GroupType.CAMPUS
++    controller.beta = GROUP_BETA[GroupType.CAMPUS]
++
++    model.topic_heat["T001"] = {g: 0.0 for g in GroupType}
++    model.topic_heat["T001"][GroupType.CAMPUS] = 1.0
++    model.intervention_tick[GroupType.CAMPUS] = None
++    model.schedule.time = 0
++    model._update_environment()
++
++    expected = math.exp(-ALPHA) * math.exp(-GROUP_BETA[GroupType.CAMPUS])
++    actual = model.topic_heat["T001"][GroupType.CAMPUS]
++    assert model.intervention_tick[GroupType.CAMPUS] == 0
++    assert abs(actual - expected) < 1e-9, \
++        f"干预应在触发 tick 立即生效，actual={actual}, expected={expected}"
++
++
++def _test_macro_spread_separate_from_forward():
++    """宏观热度扩散只记 cross_group_spread，不得污染 Agent 转发数。"""
++    from types_def import SimConfig, GroupType
++    from opinion_model import OpinionModel
++
++    model = OpinionModel(SimConfig(
++        n_agents=4,
++        network_params={"m": 1, "cross_group_spread_probability": 1.0},
++        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
++    ))
++    model.topic_heat["T001"] = {g: 0.0 for g in GroupType}
++    model.topic_heat["T001"][GroupType.DORM] = 1.0
++    model._update_environment()
++
++    assert model.cross_group_spread > 0, "概率为 1 时应发生宏观跨群热度扩散"
++    assert model.cross_group_forward == 0, \
++        "没有 Agent FORWARD 时，cross_group_forward 必须保持 0"
++
++
+ def _test_model_single_node():
+     from types_def import SimConfig
+     from opinion_model import OpinionModel
+@@ -410,8 +578,12 @@
+ 
+     print("\n── [A]  OpinionModel 核心流程（v2）")
+     _check("DataCollector 含§5全部指标列",     _test_model_datacollector_format)
+-    _check("submit_action 写缓存+热度+负面度", _test_model_submit_action_v2)
++    _check("submit_action 写缓存+热度+真实跨群转发", _test_model_submit_action_v2)
++    _check("异群可见消息可形成带 target_id 的 FORWARD", _test_cross_group_visibility_and_forward_target)
+     _check("_update_environment 热度衰减≥0",   _test_model_update_environment)
++    _check("各群按自身 β 衰减（CAMPUS 最快）", _test_group_specific_heat_decay)
++    _check("干预衰减在触发 tick 立即生效", _test_intervention_applies_same_tick)
++    _check("宏观扩散与 Agent 转发指标分离", _test_macro_spread_separate_from_forward)
+     _check("_place_agents 给每个 agent 分配 group_type", _test_model_place_agents_group_type)
+     _check("n=1 单节点 5步不崩溃",             _test_model_single_node)
+ 
+--- a/test_module_a.py
++++ b/test_module_a.py
+@@ -10,8 +10,9 @@
+   1. submit_action 正确更新 topic_heat / topic_negative / cross_group_forward
+   2. _update_environment 热度按 H_k 公式衰减（CAMPUS 最快）
+   3. intervention_tick 在 H(t) ≥ THETA 时正确触发
+-  4. DataCollector 含接口表§5 全部指标列
++  4. DataCollector 含接口表§5 全部指标列及 cross_group_spread 扩展列
+   5. 全部 event_id 已替换为 topic_id
++  6. Agent 实际跨群转发与宏观热度扩散分别统计
+ 
+ 【修复说明】
+   TestOpinionModel 直接继承 OpinionModel，只覆盖 __init__ 注入假 B/C 模块，
+@@ -157,11 +158,26 @@
+             negative_score=max(0.0, min(1.0, (1.0 - self.valence) / 2.0)),
+             heat=random.uniform(0.05, 0.5),
+             tick=self.model.schedule.time,
+-            target_id=None,
++            # FORWARD 的 target_id 表示原消息作者。测试桩直接选择一个异群
++            # Agent，确保验证的是微观跨群转发，而非宏观热度扩散。
++            target_id=(
++                self._pick_cross_group_source()
++                if action_type == ActionType.FORWARD else None
++            ),
+         )
+         self.pending_action = record
+         self.model.submit_action(record)
+ 
++    def _pick_cross_group_source(self):
++        own_group = self.beliefs.identity.group_type
++        candidates = [
++            a for a in list(self.model.schedule.agents)
++            if a.unique_id != self.unique_id
++            and hasattr(a, "beliefs")
++            and a.beliefs.identity.group_type != own_group
++        ]
++        return random.choice(candidates).unique_id if candidates else None
++
+ 
+ # ============================================================
+ # 2. 假 HawkesEngine（C 模块桩）
+@@ -234,6 +250,9 @@
+         # mesa_compat / Mesa 2.x 兜底
+         if hasattr(self.schedule, '_agents') and isinstance(self.schedule._agents, dict):
+             self.schedule._agents.clear()
++        # OpinionModel 自维护的 O(1) 查找表也必须同步清空，否则会继续指向
++        # 父类初始化时创建的旧 SocialAgent。
++        self._agent_dict.clear()
+         # 清空 grid 节点上的 agent 列表
+         try:
+             for node in self.grid.G.nodes():
+@@ -283,6 +302,7 @@
+                 self.grid.place_agent(a, node)
+             except Exception:
+                 a.pos = node
++            self._register_agent(a)
+             agent_id += 1
+ 
+         # 再放其余 agent
+@@ -295,6 +315,7 @@
+                 self.grid.place_agent(a, node)
+             except Exception:
+                 a.pos = node
++            self._register_agent(a)
+             agent_id += 1
+ 
+     # ----------------------------------------------------------
+@@ -357,6 +378,7 @@
+                 f"avg_op={last['avg_opinion']:+.3f} | "
+                 f"msg={last['message_count']:4.0f} | "
+                 f"cross_fwd={last['cross_group_forward']:3.0f} | "
++                f"heat_spread={last['cross_group_spread']:3.0f} | "
+                 f"neg_emo={last['negative_emotion']:.3f}"
+             )
+ 
+@@ -374,7 +396,8 @@
+     required_cols = {
+         "avg_opinion", "polarization", "emotional_contagion",
+         "message_count", "negative_emotion", "distortion_level",
+-        "cross_group_forward", "intervention_tick", "recovery_time",
++        "cross_group_forward", "cross_group_spread",
++        "intervention_tick", "recovery_time",
+     }
+     for col in sorted(required_cols):
+         ok = col in df.columns
+@@ -434,7 +457,8 @@
+     else:
+         print("   ⚠️ 缓存为空（EXPIRE_TICKS 已淘汰）")
+ 
+-    print(f"\n5️⃣  跨群转发累计: {model.cross_group_forward} 次")
++    print(f"\n5️⃣  Agent 实际跨群转发累计: {model.cross_group_forward} 次")
++    print(f"    宏观热度跨群扩散累计:   {model.cross_group_spread} 次")
+ 
+     print(f"\n6️⃣  行动缓存最后 3 条（或全部若 < 3）:")
+     recent = model.info_stream_cache[-3:] if model.info_stream_cache else []
+@@ -457,6 +481,7 @@
+         and df.isnull().sum().sum() == 0
+         and df["avg_opinion"].abs().max() <= 1.0
+         and df["message_count"].sum() > 0
++        and df["cross_group_forward"].iloc[-1] > 0
+     )
+     print("\n" + "="*70)
+     print(f"{'✅' if all_ok else '❌'} W4 联调{'通过' if all_ok else '失败，请检查上述输出'}:")
+@@ -465,5 +490,6 @@
+         print("  - AgentType/GroupType/ActionType/MessageType 枚举对齐 v2 ✅")
+         print("  - submit_action 更新 topic_heat/topic_negative/cross_group_forward ✅")
+         print("  - _update_environment 热度按 H_k 公式衰减 ✅")
+-        print("  - DataCollector 含接口表§5 全部 9 个指标列 ✅")
++        print("  - Agent 实际跨群转发与宏观热度扩散已分离 ✅")
++        print("  - DataCollector 含接口表§5指标及 cross_group_spread 扩展列 ✅")
+     print("="*70)
+--- a/run_sim.py
++++ b/run_sim.py
+@@ -119,7 +119,8 @@
+                 f"avg_opinion={last['avg_opinion']:+.3f} | "
+                 f"polarization={last['polarization']:.3f} | "
+                 f"msg_count={last['message_count']:5.0f} | "
+-                f"cross_fwd={last['cross_group_forward']:4.0f}"
++                f"cross_fwd={last['cross_group_forward']:4.0f} | "
++                f"heat_spread={last['cross_group_spread']:4.0f}"
+             )
+ 
+     t_run = time.perf_counter() - t_start
+@@ -140,7 +141,8 @@
+     required_cols = {
+         "avg_opinion", "polarization", "emotional_contagion",
+         "message_count", "negative_emotion", "distortion_level",
+-        "cross_group_forward", "intervention_tick", "recovery_time",
++        "cross_group_forward", "cross_group_spread",
++        "intervention_tick", "recovery_time",
+     }
+     cols_ok = required_cols.issubset(set(df.columns))
+     missing = required_cols - set(df.columns)
+@@ -154,7 +156,8 @@
+     op_end   = df["avg_opinion"].iloc[-1]
+     print(f"  ⑤ 观点演化: {op_start:+.3f} → {op_end:+.3f}")
+ 
+-    print(f"  ⑥ 跨群转发: 累计 {int(df['cross_group_forward'].iloc[-1])} 次")
++    print(f"  ⑥ Agent 实际跨群转发: 累计 {int(df['cross_group_forward'].iloc[-1])} 次")
++    print(f"     宏观热度跨群扩散:   累计 {int(df['cross_group_spread'].iloc[-1])} 次")
+     int_tick = df["intervention_tick"].iloc[-1]
+     print(f"  ⑦ 最早干预时刻: {int_tick} tick")
+ 
+@@ -206,7 +209,7 @@
+     _sub(1, 0, df["emotional_contagion"], "#7C3AED", "情绪传播速度",   "③ 情绪传播速度")
+     _sub(1, 1, df["message_count"],       "#16A34A", "消息总量",       "④ 信息流消息量")
+     _sub(2, 0, df["negative_emotion"],    "#EA580C", "负面情绪比例",   "⑤ 负面情绪指数",      (0, 1.05))
+-    _sub(2, 1, df["cross_group_forward"], "#0891B2", "跨群转发次数",   "⑥ 跨群转发累计")
++    _sub(2, 1, df["cross_group_forward"], "#0891B2", "Agent 跨群转发次数", "⑥ 实际跨群转发累计")
+ 
+     img_path = os.path.join(out_dir, "simulation_trends_w4.png")
+     plt.savefig(img_path, dpi=150, bbox_inches="tight")
+--- a/types_def.py
++++ b/types_def.py
+@@ -232,6 +232,7 @@
+     agent_id:         int             = 0
+     action_type:      ActionType      = ActionType.SEND_MESSAGE
+     content:          str             = ""
++    # REPLY：被回复者；FORWARD：被转发消息的原作者（用于识别跨群来源）
+     target_id:        Optional[int]   = None
+     tick:             int             = 0
+     topic_id:         str             = "T001"           # 原 event_id
+@@ -254,7 +255,8 @@
+     goal_type: str           = "discuss"
+     priority:  float         = 0.5          # [0, 1]
+     topic_id:  str           = "T001"       # 原 event_id
+-    target_id: Optional[int] = None         # v2 新增：reply 欲望时指向目标 agent
++    # reply 时指向被回复者；share 时指向被转发消息的原作者
++    target_id: Optional[int] = None
+ 
+ 
+ @dataclass
+--- a/config.yaml
++++ b/config.yaml
+@@ -27,6 +27,8 @@
+ network_type: "barabasi_albert"   # 无标度网络（幂律分布，类似真实社交网络）
+ network_params:
+   m: 3                             # 每个新节点连接 m 条边
++  cross_group_visibility: 0.10     # 异群消息进入当前 Agent 感知流的概率
++  cross_group_spread_probability: 0.15  # 宏观热度向其他群扩散的概率
+ 
+ n_steps: 50
+ 
+--- a/config_1000.yaml
++++ b/config_1000.yaml
+@@ -21,6 +21,8 @@
+ network_type: "barabasi_albert"
+ network_params:
+   m: 3
++  cross_group_visibility: 0.10
++  cross_group_spread_probability: 0.15
+ 
+ n_steps: 50
+ 
+--- a/config_single.yaml
++++ b/config_single.yaml
+@@ -21,6 +21,8 @@
+ network_type: "barabasi_albert"
+ network_params:
+   m: 3            # n=1 时会自动退化为单节点图
++  cross_group_visibility: 0.10
++  cross_group_spread_probability: 0.15
+ 
+ n_steps: 5        # 跑5步即可，验证循环不崩
+ 

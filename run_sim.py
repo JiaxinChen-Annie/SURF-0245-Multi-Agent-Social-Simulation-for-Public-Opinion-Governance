@@ -119,7 +119,8 @@ def run(config_path: str, save_plot: bool = True) -> None:
                 f"avg_opinion={last['avg_opinion']:+.3f} | "
                 f"polarization={last['polarization']:.3f} | "
                 f"msg_count={last['message_count']:5.0f} | "
-                f"cross_fwd={last['cross_group_forward']:4.0f}"
+                f"cross_fwd={last['cross_group_forward']:4.0f} | "
+                f"heat_spread={last['cross_group_spread']:4.0f}"
             )
 
     t_run = time.perf_counter() - t_start
@@ -140,7 +141,8 @@ def run(config_path: str, save_plot: bool = True) -> None:
     required_cols = {
         "avg_opinion", "polarization", "emotional_contagion",
         "message_count", "negative_emotion", "distortion_level",
-        "cross_group_forward", "intervention_tick", "recovery_time",
+        "cross_group_forward", "cross_group_spread",
+        "intervention_tick", "recovery_time",
     }
     cols_ok = required_cols.issubset(set(df.columns))
     missing = required_cols - set(df.columns)
@@ -154,7 +156,8 @@ def run(config_path: str, save_plot: bool = True) -> None:
     op_end   = df["avg_opinion"].iloc[-1]
     print(f"  ⑤ 观点演化: {op_start:+.3f} → {op_end:+.3f}")
 
-    print(f"  ⑥ 跨群转发: 累计 {int(df['cross_group_forward'].iloc[-1])} 次")
+    print(f"  ⑥ Agent 实际跨群转发: 累计 {int(df['cross_group_forward'].iloc[-1])} 次")
+    print(f"     宏观热度跨群扩散:   累计 {int(df['cross_group_spread'].iloc[-1])} 次")
     int_tick = df["intervention_tick"].iloc[-1]
     print(f"  ⑦ 最早干预时刻: {int_tick} tick")
 
@@ -206,7 +209,7 @@ def _plot_trends(df, config: SimConfig, out_dir: str) -> None:
     _sub(1, 0, df["emotional_contagion"], "#7C3AED", "情绪传播速度",   "③ 情绪传播速度")
     _sub(1, 1, df["message_count"],       "#16A34A", "消息总量",       "④ 信息流消息量")
     _sub(2, 0, df["negative_emotion"],    "#EA580C", "负面情绪比例",   "⑤ 负面情绪指数",      (0, 1.05))
-    _sub(2, 1, df["cross_group_forward"], "#0891B2", "跨群转发次数",   "⑥ 跨群转发累计")
+    _sub(2, 1, df["cross_group_forward"], "#0891B2", "Agent 跨群转发次数", "⑥ 实际跨群转发累计")
 
     img_path = os.path.join(out_dir, "simulation_trends_w4.png")
     plt.savefig(img_path, dpi=150, bbox_inches="tight")

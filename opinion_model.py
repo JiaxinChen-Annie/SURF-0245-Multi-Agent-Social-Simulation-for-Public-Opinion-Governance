@@ -22,6 +22,12 @@ opinion_model.py — 模型/环境层（接口表 #12–20）
   - intervention_tick 由本模块统一维护（B 模块写的为参考值，A 为权威）
   - 所有 event_id → topic_id，枚举对齐新版
 
+【转发行为修复】
+  - 同群消息始终可见，异群消息按 cross_group_visibility 概率进入感知流
+  - cross_group_forward 只统计 Agent 实际执行的跨群 FORWARD
+  - 宏观热度扩散单独统计为 cross_group_spread，不再污染转发指标
+  - 热度衰减按群选择对应 B Agent，避免用第一个 Agent 的 β 计算所有群
+
 【W4 LLM 接入变更】
   - __init__ 新增 ⑤-b：读取 config.llm_config，调用 C 模块 setup_llm_client
     初始化 self._llm_client，挂载到模型实例供所有 SocialAgent 通过
@@ -57,10 +63,18 @@ except ImportError:
 
 from types_def import (
     SimConfig, AgentType, GroupType, ActionRecord, ActionType,
-    MessageType, EmotionState, ALPHA, THETA, GROUP_BETA,
+    EmotionState, ALPHA, THETA, GROUP_BETA,
 )
 
 _LOG = logging.getLogger("OpinionModel")
+
+
+def _as_probability(value: Any, default: float) -> float:
+    """把配置值安全转换到 [0, 1]；非法值回退到 default。"""
+    try:
+        return float(np.clip(float(value), 0.0, 1.0))
+    except (TypeError, ValueError):
+        return default
 
 
 class OpinionModel(Model):
@@ -74,6 +88,9 @@ class OpinionModel(Model):
     LLM 客户端（C 模块）挂载在 self._llm_client，
     供所有 SocialAgent 通过 self.model._llm_client 访问。
     """
+
+    DEFAULT_CROSS_GROUP_VISIBILITY = 0.10
+    DEFAULT_CROSS_GROUP_SPREAD_PROBABILITY = 0.15
 
     # ================================================================== #
     #  #12  __init__                                                       #
@@ -89,6 +106,23 @@ class OpinionModel(Model):
         """
         super().__init__()
         self.config = config
+
+        # 跨群行为参数。沿用 network_params 承载，避免破坏 SimConfig 接口。
+        network_params = config.network_params or {}
+        self.cross_group_visibility = _as_probability(
+            network_params.get(
+                "cross_group_visibility",
+                self.DEFAULT_CROSS_GROUP_VISIBILITY,
+            ),
+            self.DEFAULT_CROSS_GROUP_VISIBILITY,
+        )
+        self.cross_group_spread_probability = _as_probability(
+            network_params.get(
+                "cross_group_spread_probability",
+                self.DEFAULT_CROSS_GROUP_SPREAD_PROBABILITY,
+            ),
+            self.DEFAULT_CROSS_GROUP_SPREAD_PROBABILITY,
+        )
 
         # ① 固定随机种子
         self.random.seed(config.random_seed)
@@ -126,8 +160,11 @@ class OpinionModel(Model):
             GroupType.CAMPUS: None,
         }
 
-        #    cross_group_forward: 跨群转发次数统计
+        #    cross_group_forward: Agent 实际跨群转发次数（微观行为）
         self.cross_group_forward: int = 0
+
+        #    cross_group_spread: 热度跨群传播次数（宏观环境机制）
+        self.cross_group_spread: int = 0
 
         #    情绪快照（供 _calc_emotional_contagion 使用）
         self._prev_emotion_snapshot: Dict[int, EmotionState] = {}
@@ -178,7 +215,8 @@ class OpinionModel(Model):
         # ⑥ DataCollector（E 模块从此处读取输出）
         #    指标对齐接口表§5：message_count / avg_opinion / polarization /
         #    negative_emotion / distortion_level / cross_group_forward /
-        #    intervention_tick / recovery_time
+        #    intervention_tick / recovery_time；另扩展 cross_group_spread，
+        #    用于与 Agent 实际转发严格区分。
         self.datacollector = DataCollector(
             model_reporters={
                 "avg_opinion":          lambda m: m._calc_avg_opinion(),
@@ -188,8 +226,9 @@ class OpinionModel(Model):
                 "negative_emotion":     lambda m: m._calc_negative_emotion(),
                 "distortion_level":     lambda m: m._calc_avg_distortion(),
                 "cross_group_forward":  lambda m: m.cross_group_forward,
+                "cross_group_spread":   lambda m: m.cross_group_spread,
                 "intervention_tick":    lambda m: m._get_earliest_intervention_tick(),
-                "recovery_time":        lambda m: m._calc_recovery_time(),
+                "recovery_time":        lambda m: m._calc_recovery_time(),  # -1 表示尚未恢复
             }
         )
 
@@ -207,6 +246,7 @@ class OpinionModel(Model):
             f"OpinionModel 初始化完成 | "
             f"n_agents={config.n_agents} | "
             f"network={config.network_type} | "
+            f"cross_visibility={self.cross_group_visibility:.2f} | "
             f"llm={'已接入' if self._llm_client is not None else '规则存根'} | "
             f"mesa={'系统' if _MESA_REAL else '垫片'}"
         )
@@ -410,27 +450,40 @@ class OpinionModel(Model):
         """
         current_tick = int(self.schedule.time)
         EXPIRE_TICKS = 10
-        SPREAD_PROB  = 0.15   # 跨群扩散概率（每步每个热话题）
 
         # ── ① 尝试获取 B 模块的 calc_heat_decay ──────────────────────
-        # B 模块将 calc_heat_decay 定义在 SocialAgent 上，
-        # A 模块通过取第一个 agent 实例来调用（若存在）。
+        # B 模块将 calc_heat_decay 定义在 SocialAgent 上，且函数内部使用
+        # agent 自身的 group_type / beta。因此必须按群选择对应 Agent，不能
+        # 用第一个 Agent 代算所有群；某群无 Agent 时使用 A 的纯函数降级。
         _agents_list = list(self.schedule.agents)  # Mesa 3.x AgentSet 需转 list 才能索引
-        _b_agent = _agents_list[0] if _agents_list else None
-        _has_b_decay = _b_agent is not None and hasattr(_b_agent, "calc_heat_decay")
+        _decay_agents: Dict[GroupType, Any] = {}
+        for _agent in _agents_list:
+            if not hasattr(_agent, "calc_heat_decay"):
+                continue
+            try:
+                _agent_group = _agent.beliefs.identity.group_type
+            except (AttributeError, TypeError):
+                continue
+            _decay_agents.setdefault(_agent_group, _agent)
 
         def _heat_decay(current_heat: float, group_type: GroupType) -> float:
             """调用 B 模块 calc_heat_decay 或本地降级。"""
             elapsed = current_tick  # elapsed_steps 即当前 tick
             t_int   = self.intervention_tick.get(group_type, None)
-            if _has_b_decay:
-                return _b_agent.calc_heat_decay(
-                    current_heat=current_heat,
-                    elapsed_steps=elapsed,
-                    intervention_tick=t_int,
-                )
-            else:
-                return self._fallback_heat_decay(current_heat, group_type, elapsed, t_int)
+            decay_agent = _decay_agents.get(group_type)
+            if decay_agent is not None:
+                try:
+                    return float(decay_agent.calc_heat_decay(
+                        current_heat=current_heat,
+                        elapsed_steps=elapsed,
+                        intervention_tick=t_int,
+                    ))
+                except Exception as exc:
+                    _LOG.debug(
+                        f"{group_type.name} 群调用 B.calc_heat_decay 失败，"
+                        f"改用 A 降级公式: {exc}"
+                    )
+            return self._fallback_heat_decay(current_heat, group_type, elapsed, t_int)
 
         # ── ② 更新各话题各群热度 ──────────────────────────────────────
         #    同时检测 intervention_tick 触发条件
@@ -439,7 +492,6 @@ class OpinionModel(Model):
         for topic_id, group_heat in self.topic_heat.items():
             for group_type in GroupType:
                 old_heat = group_heat[group_type]
-                new_heat = _heat_decay(old_heat, group_type)
 
                 # 检测 CONTROLLER 干预触发（H(t) ≥ θ，该群有 CONTROLLER，且未记录）
                 if (group_type != GroupType.DORM
@@ -452,6 +504,9 @@ class OpinionModel(Model):
                         f"H={old_heat:.3f} ≥ θ={THETA}"
                     )
 
+                # 触发时先写入 intervention_tick，再计算 H(t+1)，从而严格满足
+                # 公式中的 𝟙[t ≥ t_k^int]，避免干预效果晚一 tick 生效。
+                new_heat = _heat_decay(old_heat, group_type)
                 group_heat[group_type] = max(0.0, new_heat)
 
             # ── ③ 跨群扩散 ────────────────────────────────────────────
@@ -459,16 +514,16 @@ class OpinionModel(Model):
                 if group_heat[src_gt] >= THETA:
                     for dst_gt in GroupType:
                         if dst_gt != src_gt:
-                            if self.random.random() < SPREAD_PROB:
+                            if self.random.random() < self.cross_group_spread_probability:
                                 # 热度传播（取较小值叠加，避免无限膨胀）
                                 spread_amount = group_heat[src_gt] * 0.1
                                 group_heat[dst_gt] = min(
                                     group_heat[dst_gt] + spread_amount,
                                     group_heat[src_gt],
                                 )
-                                self.cross_group_forward += 1
+                                self.cross_group_spread += 1
                                 _LOG.debug(
-                                    f"[tick={current_tick}] 跨群扩散 "
+                                    f"[tick={current_tick}] 热度跨群扩散 "
                                     f"{src_gt.name}→{dst_gt.name} "
                                     f"topic={topic_id} +{spread_amount:.3f}"
                                 )
@@ -574,7 +629,8 @@ class OpinionModel(Model):
         W4 新增：
           - 处理 record.heat / record.negative_score / record.message_type
           - 若 source 与 target 属不同群，cross_group_forward 计数 +1
-            （此处基于 message_type=FORWARD 且有 target_id 时判断）
+            （此处基于 action_type=FORWARD 且有 target_id 时判断；
+             FORWARD 的 target_id 表示被转发消息的原作者）
 
         Parameters
         ----------
@@ -612,8 +668,10 @@ class OpinionModel(Model):
             (1 - SMOOTH) * old_neg + SMOOTH * record.negative_score
         )
 
-        # ⑥ 跨群转发判断：FORWARD 类型 + 有 target_id → 检查目标所在群
-        if (record.message_type == MessageType.FORWARD
+        # ⑥ 跨群转发判断：FORWARD 行动 + 有来源作者 → 检查两者所在群
+        # 使用 action_type，而非 message_type：RATIONAL/ORDINARY 的转发可能
+        # 以 PARAPHRASE 表达，但仍是一次真实的 FORWARD 行为。
+        if (record.action_type == ActionType.FORWARD
                 and record.target_id is not None):
             tgt_agent = self._get_agent_by_id(record.target_id)
             if tgt_agent and hasattr(tgt_agent, "beliefs"):
@@ -647,16 +705,35 @@ class OpinionModel(Model):
         return GroupType.CLASS
 
     def get_group_messages(self, agent_id: int, limit: int = 20) -> List[ActionRecord]:
-        """返回与 agent 同群的最近消息（供 B 模块 _perceive 使用）。"""
+        """
+        返回 Agent 可见的最近消息。
+
+        - 同群消息始终可见；
+        - 异群消息以 ``cross_group_visibility`` 概率可见，模拟从其他群
+          截图、转述或转发进入当前群的信息；
+        - 返回顺序仍为从新到旧，最多 ``limit`` 条。
+        """
+        if limit <= 0:
+            return []
+
         src_group = self.get_group_type(agent_id)
-        result = []
+        result: List[ActionRecord] = []
         for record in reversed(self.info_stream_cache):
             rec_agent = self._get_agent_by_id(record.agent_id)
-            if rec_agent and hasattr(rec_agent, "beliefs"):
-                if rec_agent.beliefs.identity.group_type == src_group:
-                    result.append(record)
-                    if len(result) >= limit:
-                        break
+            if not rec_agent or not hasattr(rec_agent, "beliefs"):
+                continue
+
+            rec_group = rec_agent.beliefs.identity.group_type
+            visible = rec_group == src_group
+            if (not visible
+                    and self.cross_group_visibility > 0.0
+                    and self.random.random() < self.cross_group_visibility):
+                visible = True
+
+            if visible:
+                result.append(record)
+                if len(result) >= limit:
+                    break
         return result
 
     def get_topic_heat(self) -> Dict[str, float]:
@@ -701,8 +778,32 @@ class OpinionModel(Model):
         return float(min(ticks)) if ticks else float("inf")
 
     def _calc_recovery_time(self) -> float:
-        """返回已记录的 recovery_time；未恢复时返回 0.0。"""
-        return float(self._recovery_time) if self._recovery_time is not None else 0.0
+        """返回恢复耗时；尚未恢复时返回 -1.0，避免与“0 tick 即恢复”混淆。"""
+        return float(self._recovery_time) if self._recovery_time is not None else -1.0
+
+    def get_final_summary(self) -> Dict[str, Any]:
+        """返回仿真结束后的最终状态，不混入逐 tick DataCollector。
+
+        ``recovery_time`` 使用 ``None`` 表示截至当前仍未恢复；这与
+        DataCollector 中用于数值列的 -1.0 哨兵值相互对应。
+        """
+        all_heats = [v for group_map in self.topic_heat.values() for v in group_map.values()]
+        max_heat = float(max(all_heats)) if all_heats else 0.0
+        earliest = self._get_earliest_intervention_tick()
+        return {
+            "simulation_tick": int(self.schedule.time),
+            "heat_exceeded_tick": self._heat_exceeded_tick,
+            "recovery_status": "recovered" if self._recovery_time is not None else "not_recovered",
+            "recovery_time": self._recovery_time,
+            "earliest_intervention_tick": None if math.isinf(earliest) else int(earliest),
+            "intervention_tick_by_group": {
+                group.name: tick for group, tick in self.intervention_tick.items()
+            },
+            "max_topic_heat": max_heat,
+            "cross_group_forward": int(self.cross_group_forward),
+            "cross_group_spread": int(self.cross_group_spread),
+            "active_message_cache_size": len(self.info_stream_cache),
+        }
 
     # ================================================================== #
     #  内部辅助                                                            #

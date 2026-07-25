@@ -21,6 +21,8 @@ group_type_ratio:
 network_type: "barabasi_albert"
 network_params:
   m: 3
+  cross_group_visibility: 0.10
+  cross_group_spread_probability: 0.15
 
 n_steps: 50
 

@@ -9,9 +9,11 @@ test_module_a.py — A 模块（OpinionModel）W4 联调测试
 验证重点（W4）：
   1. submit_action 正确更新 topic_heat / topic_negative / cross_group_forward
   2. _update_environment 热度按 H_k 公式衰减（CAMPUS 最快）
-  3. intervention_tick 在 H(t) ≥ THETA 时正确触发
-  4. DataCollector 含接口表§5 全部指标列
-  5. 全部 event_id 已替换为 topic_id
+  3. 热度从阈值以下逐步升高，并在中间 tick 触发 intervention_tick
+  4. DataCollector 含接口表§5 全部指标列及 cross_group_spread 扩展列
+  5. recovery_time 未恢复时为 -1；后处理结果单独写入 final_summary
+  6. DummyAgent 基于实际可见消息自然产生 FORWARD，不强制选择异群目标
+  7. FORWARD 的 message_type 只能是 forward/paraphrase
 
 【修复说明】
   TestOpinionModel 直接继承 OpinionModel，只覆盖 __init__ 注入假 B/C 模块，
@@ -100,64 +102,78 @@ class DummyAgent(Agent):
         return max(0.0, current_heat * natural * int_decay)
 
     def step(self):
-        """每步随机游走观点 + 提交 ActionRecord 到 A 模块。"""
-        # 观点/情绪随机游走
-        self.opinion = max(-1.0, min(1.0, self.opinion + random.uniform(-0.08, 0.08)))
-        self.valence = max(-1.0, min(1.0, self.valence + random.uniform(-0.06, 0.06)))
+        """按角色概率行动；转发来源只能来自当前实际可见消息。"""
+        rng = self.model.random
+
+        self.opinion = max(-1.0, min(1.0, self.opinion + rng.uniform(-0.08, 0.08)))
+        self.valence = max(-1.0, min(1.0, self.valence + rng.uniform(-0.06, 0.06)))
         self.beliefs.opinions["T001"].opinion_value = self.opinion
         self.beliefs.emotion.valence = self.valence
-        # 同步更新 arousal（emotional_contagion 计算 arousal 的 tick 间变化量）
         self.beliefs.emotion.arousal = max(0.0, min(1.0,
-            self.beliefs.emotion.arousal + random.uniform(-0.06, 0.06)
+            self.beliefs.emotion.arousal + rng.uniform(-0.06, 0.06)
         ))
 
-        # 随机决定 action_type（约 25% 沉默）
-        action_type = random.choice([
-            ActionType.SEND_MESSAGE,
-            ActionType.REPLY,
-            ActionType.FORWARD,
-            ActionType.SILENT,
-        ])
+        visible = [
+            r for r in self.model.get_group_messages(self.unique_id, limit=20)
+            if r.agent_id != self.unique_id
+        ]
+        agent_type = self.beliefs.identity.agent_type
+        forward_prob = {
+            AgentType.ORDINARY: 0.05,
+            AgentType.ACTIVE: 0.30,
+            AgentType.RATIONAL: 0.10,
+            AgentType.CONTROLLER: 0.04,
+        }[agent_type]
+
+        roll = rng.random()
+        source = None
+        if visible and roll < forward_prob:
+            action_type = ActionType.FORWARD
+            source = rng.choice(visible)
+        elif visible and roll < forward_prob + 0.18:
+            action_type = ActionType.REPLY
+            source = rng.choice(visible)
+        elif roll < forward_prob + 0.58:
+            action_type = ActionType.SEND_MESSAGE
+        else:
+            action_type = ActionType.SILENT
+
         if action_type == ActionType.SILENT:
             self.pending_action = None
             return
 
-        # 按角色选 message_type
-        agent_type = self.beliefs.identity.agent_type
-        if agent_type == AgentType.CONTROLLER:
+        if action_type == ActionType.FORWARD:
+            msg_type = (MessageType.FORWARD if agent_type == AgentType.ACTIVE
+                        else MessageType.PARAPHRASE)
+        elif agent_type == AgentType.CONTROLLER:
             msg_type = MessageType.CLARIFICATION
-        elif agent_type == AgentType.ACTIVE:
-            msg_type = random.choice([MessageType.FORWARD, MessageType.PARAPHRASE])
-        elif agent_type == AgentType.RATIONAL:
-            msg_type = MessageType.ORIGINAL
+        elif self.valence < -0.3 and self.beliefs.emotion.arousal > 0.6:
+            msg_type = MessageType.EXAGGERATE
         else:
-            if self.valence < -0.3 and self.beliefs.emotion.arousal > 0.6:
-                msg_type = MessageType.EXAGGERATE
-            else:
-                msg_type = MessageType.ORIGINAL
+            msg_type = MessageType.ORIGINAL
 
         distortion_map = {
-            MessageType.ORIGINAL:      0.0,
-            MessageType.FORWARD:       0.05,
-            MessageType.PARAPHRASE:    0.25,
-            MessageType.EXAGGERATE:    0.70,
+            MessageType.ORIGINAL: 0.0,
+            MessageType.FORWARD: 0.05,
+            MessageType.PARAPHRASE: 0.25,
+            MessageType.EXAGGERATE: 0.70,
             MessageType.CLARIFICATION: 0.0,
         }
-
+        source_text = f" 来源Agent-{source.agent_id}" if source is not None else ""
         record = ActionRecord(
             agent_id=self.unique_id,
             action_type=action_type,
             content=(
                 f"[{self.beliefs.identity.group_type.name}/{agent_type.name}]"
-                f" Agent-{self.unique_id} 消息"
+                f" Agent-{self.unique_id} 消息{source_text}"
             ),
             topic_id="T001",
-            distortion_level=distortion_map.get(msg_type, 0.0),
+            distortion_level=distortion_map[msg_type],
             message_type=msg_type,
             negative_score=max(0.0, min(1.0, (1.0 - self.valence) / 2.0)),
-            heat=random.uniform(0.05, 0.5),
-            tick=self.model.schedule.time,
-            target_id=None,
+            heat=rng.uniform(0.05, 0.35),
+            tick=int(self.model.schedule.time),
+            target_id=source.agent_id if source is not None else None,
         )
         self.pending_action = record
         self.model.submit_action(record)
@@ -203,7 +219,7 @@ class TestOpinionModel(OpinionModel):
             },
             network_params={"m": max(1, min(3, n_agents - 1))},
             hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
-            random_seed=__import__('random').randint(0, 2**31),  # 每次随机
+            random_seed=20260725,
         )
 
         # 调用父类 __init__（会创建 schedule/grid/datacollector/hawkes/agents）
@@ -234,6 +250,9 @@ class TestOpinionModel(OpinionModel):
         # mesa_compat / Mesa 2.x 兜底
         if hasattr(self.schedule, '_agents') and isinstance(self.schedule._agents, dict):
             self.schedule._agents.clear()
+        # OpinionModel 自维护的 O(1) 查找表也必须同步清空，否则会继续指向
+        # 父类初始化时创建的旧 SocialAgent。
+        self._agent_dict.clear()
         # 清空 grid 节点上的 agent 列表
         try:
             for node in self.grid.G.nodes():
@@ -283,6 +302,7 @@ class TestOpinionModel(OpinionModel):
                 self.grid.place_agent(a, node)
             except Exception:
                 a.pos = node
+            self._register_agent(a)
             agent_id += 1
 
         # 再放其余 agent
@@ -295,6 +315,7 @@ class TestOpinionModel(OpinionModel):
                 self.grid.place_agent(a, node)
             except Exception:
                 a.pos = node
+            self._register_agent(a)
             agent_id += 1
 
     # ----------------------------------------------------------
@@ -333,12 +354,9 @@ if __name__ == "__main__":
           f"CAMPUS(β={GROUP_BETA[GroupType.CAMPUS]})")
     print(f"  - 干预阈值:   θ = {THETA}，自然衰减率 α = {ALPHA}")
 
-    # 注入初始热度（全部群超过 THETA=0.7），触发干预 + recovery_time 追踪
+    # 主仿真从低热度自然启动，不再把所有群直接置于阈值之上。
     for g in GroupType:
-        model.topic_heat["T001"][g] = 0.85
-    # 重置超阈追踪，让第一步 _update_environment 重新检测并记录超阈时刻
-    model._heat_exceeded_tick = None
-    model._recovery_time      = None
+        model.topic_heat["T001"][g] = 0.05
 
     # 热度快照（每10步记录一次，供后续展示）
     _heat_log = {g: [] for g in GroupType}
@@ -357,6 +375,7 @@ if __name__ == "__main__":
                 f"avg_op={last['avg_opinion']:+.3f} | "
                 f"msg={last['message_count']:4.0f} | "
                 f"cross_fwd={last['cross_group_forward']:3.0f} | "
+                f"heat_spread={last['cross_group_spread']:3.0f} | "
                 f"neg_emo={last['negative_emotion']:.3f}"
             )
 
@@ -374,39 +393,63 @@ if __name__ == "__main__":
     required_cols = {
         "avg_opinion", "polarization", "emotional_contagion",
         "message_count", "negative_emotion", "distortion_level",
-        "cross_group_forward", "intervention_tick", "recovery_time",
+        "cross_group_forward", "cross_group_spread",
+        "intervention_tick", "recovery_time",
     }
     for col in sorted(required_cols):
         ok = col in df.columns
         val = f"= {df[col].mean():.3f}" if ok else ""
         print(f"   {'✅' if ok else '❌'}  {col:30s} {val}")
 
-    # ── 补充：纯衰减验证 recovery_time（不展示热度，仅用于验证逻辑）──
-    # 记录仿真期间各群热度快照（每10步采一次）
-    _heat_snapshots = {g: [] for g in GroupType}
+    # ── 独立探针1：验证热度从阈值以下逐步升高后，在中间 tick 触发干预 ──
+    probe = TestOpinionModel(n_agents=20, n_steps=12)
+    probe.cross_group_spread_probability = 0.0
+    for g in GroupType:
+        probe.topic_heat["T001"][g] = 0.0
+    probe.intervention_tick = {g: None for g in GroupType}
+    probe._heat_exceeded_tick = None
+    probe._recovery_time = None
+    class_agent = next(a for a in probe.schedule.agents
+                       if a.beliefs.identity.group_type == GroupType.CLASS)
+    intervention_heat_trace = []
+    for _ in range(12):
+        probe.submit_action(ActionRecord(
+            agent_id=class_agent.unique_id,
+            action_type=ActionType.SEND_MESSAGE,
+            content="受控升温消息", topic_id="T001",
+            message_type=MessageType.ORIGINAL,
+            distortion_level=0.0, negative_score=0.3, heat=0.18,
+            tick=int(probe.schedule.time),
+        ))
+        probe._update_environment()
+        intervention_heat_trace.append(probe.topic_heat["T001"][GroupType.CLASS])
+        probe.schedule.time += 1
+        probe.schedule.steps += 1
+        if probe.intervention_tick[GroupType.CLASS] is not None:
+            break
+    gradual_intervention_tick = probe.intervention_tick[GroupType.CLASS]
 
-    if model._recovery_time is None and model._heat_exceeded_tick is not None:
-        for _decay_step in range(200):
-            model._update_environment()
-            model.schedule.time += 1
-            if model._recovery_time is not None:
-                break
-    elif model._heat_exceeded_tick is None:
-        model._heat_exceeded_tick = 0
-        for _decay_step in range(200):
-            model._update_environment()
-            model.schedule.time += 1
-            if model._recovery_time is not None:
-                break
+    # ── 独立探针2：停止新消息后纯衰减，结果只写入 final_summary ──
+    decay_model = TestOpinionModel(n_agents=20, n_steps=0)
+    decay_model.cross_group_spread_probability = 0.0
+    for g in GroupType:
+        decay_model.topic_heat["T001"][g] = 0.85
+    decay_model._heat_exceeded_tick = 0
+    decay_model._recovery_time = None
+    decay_model._update_environment()
+    decay_model.schedule.time += 1
+    for _ in range(200):
+        if decay_model._recovery_time is not None:
+            break
+        decay_model._update_environment()
+        decay_model.schedule.time += 1
+    final_summary = decay_model.get_final_summary()
 
     print(f"\n3️⃣  热度与干预验证:")
-    earliest = model._get_earliest_intervention_tick()
-    if earliest == float("inf"):
-        print(f"   最早干预时刻: 未触发（所有群热度始终 < θ）")
-    else:
-        print(f"   最早干预时刻: {int(earliest)} tick（第 {int(earliest)} 步触发干预）")
-    print(f"   各群 intervention_tick: "
-          f"{ {g.name: v for g, v in model.intervention_tick.items()} }")
+    print(f"   受控升温轨迹(CLASS): {[round(v, 3) for v in intervention_heat_trace]}")
+    print(f"   CLASS 渐进触发 tick: {gradual_intervention_tick}")
+    gradual_ok = gradual_intervention_tick is not None and gradual_intervention_tick > 0
+    print(f"   {'✅' if gradual_ok else '❌'} 干预不是 tick 0 立即触发，而是在升温过程中触发")
     df_tmp = model.datacollector.get_model_vars_dataframe()
     from types_def import GROUP_BETA as _GB
     print(f"   各群热度（仿真期间实时快照，每10步）:")
@@ -418,11 +461,10 @@ if __name__ == "__main__":
         note = "← 无干预衰减最慢" if g == GroupType.DORM else ""
         print(f"     {g.name:8s}({beta_str}): {vals}  {note}")
     print(f"   仿真期最大 message_count: {int(df_tmp['message_count'].max())} 条（热度叠加来源）")
-    print(f"   热度首次超阈 tick : {model._heat_exceeded_tick}")
-    if model._recovery_time is not None:
-        print(f"   ✅ recovery_time   : {model._recovery_time} tick（热度从超阈到回落所需步数）")
-    else:
-        print(f"   ⚠️  recovery_time  : 仿真结束时热度仍未回落（50步内属正常）")
+    print(f"   主仿真 DataFrame recovery_time 唯一值: {sorted(df['recovery_time'].unique().tolist())}")
+    print(f"   final_summary: {final_summary}")
+    recovery_ok = (df['recovery_time'] == -1.0).any() and final_summary['recovery_time'] is not None
+    print(f"   {'✅' if recovery_ok else '❌'} 未恢复=-1；纯衰减恢复结果单独进入 final_summary")
 
     print(f"\n4️⃣  topic_id 检查（不应有 event_id）:")
     if model.info_stream_cache:
@@ -434,7 +476,13 @@ if __name__ == "__main__":
     else:
         print("   ⚠️ 缓存为空（EXPIRE_TICKS 已淘汰）")
 
-    print(f"\n5️⃣  跨群转发累计: {model.cross_group_forward} 次")
+    print(f"\n5️⃣  Agent 实际跨群转发累计: {model.cross_group_forward} 次")
+    print(f"    宏观热度跨群扩散累计:   {model.cross_group_spread} 次")
+
+    forward_records = [r for r in model.info_stream_cache if r.action_type == ActionType.FORWARD]
+    invalid_forward_types = [r for r in forward_records
+                             if r.message_type not in {MessageType.FORWARD, MessageType.PARAPHRASE}]
+    print(f"    当前缓存 FORWARD 数: {len(forward_records)}，消息类型异常数: {len(invalid_forward_types)}")
 
     print(f"\n6️⃣  行动缓存最后 3 条（或全部若 < 3）:")
     recent = model.info_stream_cache[-3:] if model.info_stream_cache else []
@@ -457,6 +505,11 @@ if __name__ == "__main__":
         and df.isnull().sum().sum() == 0
         and df["avg_opinion"].abs().max() <= 1.0
         and df["message_count"].sum() > 0
+        and df["cross_group_forward"].iloc[-1] > 0
+        and gradual_ok
+        and recovery_ok
+        and not invalid_forward_types
+        and (df["recovery_time"] != 0.0).all()
     )
     print("\n" + "="*70)
     print(f"{'✅' if all_ok else '❌'} W4 联调{'通过' if all_ok else '失败，请检查上述输出'}:")
@@ -465,5 +518,10 @@ if __name__ == "__main__":
         print("  - AgentType/GroupType/ActionType/MessageType 枚举对齐 v2 ✅")
         print("  - submit_action 更新 topic_heat/topic_negative/cross_group_forward ✅")
         print("  - _update_environment 热度按 H_k 公式衰减 ✅")
-        print("  - DataCollector 含接口表§5 全部 9 个指标列 ✅")
+        print("  - Agent 基于实际可见消息自然转发，未强制选择异群目标 ✅")
+        print("  - FORWARD 与 forward/paraphrase 消息类型语义一致 ✅")
+        print("  - 渐进升温在中间 tick 触发干预 ✅")
+        print("  - 未恢复使用 -1，最终恢复结果进入 final_summary ✅")
+        print("  - Agent 实际跨群转发与宏观热度扩散已分离 ✅")
+        print("  - DataCollector 含接口表§5指标及 cross_group_spread 扩展列 ✅")
     print("="*70)

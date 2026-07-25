@@ -11,6 +11,8 @@ test_contract.py — 接口契约验证脚本（v2，W4）
   - SocialAgent.__init__ 新增 group_type 参数验证
   - calc_heat_decay 接口验证（#11）
   - Perception 新增字段检查
+  - 跨群可见、FORWARD target_id、微观/宏观计数分离回归测试
+  - 各群 β 与干预触发 tick 的热度公式回归测试
 
 用法：python3 test_contract.py
 """
@@ -296,7 +298,8 @@ def _test_model_datacollector_format():
     required = {
         "avg_opinion", "polarization", "emotional_contagion",
         "message_count", "negative_emotion", "distortion_level",
-        "cross_group_forward", "intervention_tick", "recovery_time",
+        "cross_group_forward", "cross_group_spread",
+        "intervention_tick", "recovery_time",
     }
     missing = required - set(df.columns)
     assert not missing, f"缺少必需列：{missing}"
@@ -308,18 +311,28 @@ def _test_model_datacollector_format():
 
 
 def _test_model_submit_action_v2():
-    """submit_action 更新 topic_heat / topic_negative / cross_group_forward。"""
-    from types_def import SimConfig, ActionRecord, ActionType, MessageType
+    """submit_action 更新热度，并按 ActionType 统计真实跨群转发。"""
+    from types_def import (
+        SimConfig, ActionRecord, ActionType, MessageType,
+        GroupType, GROUP_BETA,
+    )
     from opinion_model import OpinionModel
     model = OpinionModel(SimConfig(
         n_agents=2,
         hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
     ))
+    agents = list(model.schedule.agents)
+    src_agent, origin_agent = agents[0], agents[1]
+    src_agent.beliefs.identity.group_type = GroupType.CLASS
+    src_agent.beta = GROUP_BETA[GroupType.CLASS]
+    origin_agent.beliefs.identity.group_type = GroupType.DORM
+    origin_agent.beta = GROUP_BETA[GroupType.DORM]
+
     before_cache = len(model.info_stream_cache)
     before_fwd   = model.cross_group_forward
 
     r = ActionRecord(
-        agent_id=0,
+        agent_id=src_agent.unique_id,
         action_type=ActionType.SEND_MESSAGE,
         content="测试消息",
         topic_id="T001",          # v2：topic_id 而非 event_id
@@ -336,9 +349,87 @@ def _test_model_submit_action_v2():
     assert "T001" in model.topic_negative, "topic_negative 应含 T001"
 
     # heat 已更新（大于初始 0.0）
-    from types_def import GroupType
     total_heat = sum(model.topic_heat["T001"].values())
     assert total_heat > 0.0, "submit_action 后 topic_heat 应增加"
+
+    # 非 ACTIVE 角色也可能用 PARAPHRASE 表达转发，因此必须看 action_type。
+    fwd = ActionRecord(
+        agent_id=src_agent.unique_id,
+        action_type=ActionType.FORWARD,
+        content="转述异群消息",
+        target_id=origin_agent.unique_id,
+        topic_id="T001",
+        distortion_level=0.25,
+        message_type=MessageType.PARAPHRASE,
+        negative_score=0.2,
+        heat=0.2,
+        tick=0,
+    )
+    model.submit_action(fwd)
+    assert model.cross_group_forward == before_fwd + 1, \
+        "真实跨群 FORWARD 应计数，不能依赖 message_type=forward"
+
+
+def _test_cross_group_visibility_and_forward_target():
+    """异群消息可见后，Agent 的 share 必须绑定原作者并形成实际跨群转发。"""
+    from types_def import (
+        SimConfig, AgentType, GroupType, GROUP_BETA,
+        ActionRecord, ActionType, MessageType,
+    )
+    from opinion_model import OpinionModel
+
+    model = OpinionModel(SimConfig(
+        n_agents=2,
+        network_params={"m": 1, "cross_group_visibility": 1.0},
+        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+    ))
+    viewer, origin = list(model.schedule.agents)
+    viewer.beliefs.identity.agent_type = AgentType.ACTIVE
+    viewer.beliefs.identity.group_type = GroupType.CLASS
+    viewer.beta = GROUP_BETA[GroupType.CLASS]
+    origin.beliefs.identity.agent_type = AgentType.ORDINARY
+    origin.beliefs.identity.group_type = GroupType.DORM
+    origin.beta = GROUP_BETA[GroupType.DORM]
+
+    source_record = ActionRecord(
+        agent_id=origin.unique_id,
+        action_type=ActionType.SEND_MESSAGE,
+        content="宿舍群里的原始消息",
+        topic_id="T001",
+        message_type=MessageType.ORIGINAL,
+        heat=0.2,
+        tick=0,
+    )
+    model.submit_action(source_record)
+
+    perception = viewer._perceive()
+    assert any(si.source_id == origin.unique_id for si in perception.recent_messages), \
+        "cross_group_visibility=1 时必须看到异群消息"
+
+    viewer._last_perception = perception
+    viewer.beliefs.emotion.arousal = 0.5
+    viewer.beliefs.emotion.valence = 0.0
+    viewer.beliefs.psychology.personality.extraversion = 1.0
+    viewer.beliefs.psychology.risk_aversion = 0.0
+
+    original_random = model.random.random
+    model.random.random = lambda: 0.0  # 强制触发 share 与行动
+    try:
+        desires = viewer._infer_desires()
+        share = next((d for d in desires if d.goal_type == "share"), None)
+        assert share is not None, "ACTIVE 在概率命中时应产生 share 欲望"
+        assert share.target_id == origin.unique_id, "share.target_id 应指向原消息作者"
+
+        intention = viewer._plan_intentions(desires)
+        assert intention.action_type == ActionType.FORWARD
+        assert intention.target_id == origin.unique_id
+
+        before = model.cross_group_forward
+        viewer._execute_action(intention)
+        assert model.cross_group_forward == before + 1, \
+            "执行后应形成一条可追踪的实际跨群转发"
+    finally:
+        model.random.random = original_random
 
 
 def _test_model_update_environment():
@@ -356,6 +447,83 @@ def _test_model_update_environment():
     new_heat = model.topic_heat["T001"][GroupType.CAMPUS]
     assert new_heat < 1.0, "热度衰减后应 < 初始值"
     assert new_heat >= 0.0, "热度不应为负"
+
+
+def _test_group_specific_heat_decay():
+    """每个群必须使用自己的 β；干预后 CAMPUS 衰减最快。"""
+    from types_def import SimConfig, GroupType
+    from opinion_model import OpinionModel
+
+    model = OpinionModel(SimConfig(
+        n_agents=20,
+        network_params={"m": 1, "cross_group_spread_probability": 0.0},
+        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+        random_seed=42,
+    ))
+    model.cross_group_spread_probability = 0.0
+    for group_type in GroupType:
+        model.topic_heat["T001"][group_type] = 0.6  # 低于 THETA，避免新触发逻辑干扰
+    model.intervention_tick[GroupType.DORM] = None
+    model.intervention_tick[GroupType.CLASS] = 0
+    model.intervention_tick[GroupType.MAJOR] = 0
+    model.intervention_tick[GroupType.CAMPUS] = 0
+    model.schedule.time = 1
+
+    model._update_environment()
+    h = model.topic_heat["T001"]
+    assert h[GroupType.DORM] > h[GroupType.CLASS] > h[GroupType.MAJOR] > h[GroupType.CAMPUS], \
+        f"群别 β 未生效：{ {g.name: h[g] for g in GroupType} }"
+
+
+def _test_intervention_applies_same_tick():
+    """H(t) 达阈值时，干预项应立即参与 H(t+1) 计算。"""
+    import math
+    from types_def import SimConfig, AgentType, GroupType, ALPHA, GROUP_BETA
+    from opinion_model import OpinionModel
+
+    model = OpinionModel(SimConfig(
+        n_agents=20,
+        network_params={"m": 1, "cross_group_spread_probability": 0.0},
+        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+        random_seed=42,
+    ))
+    model.cross_group_spread_probability = 0.0
+
+    controller = list(model.schedule.agents)[0]
+    controller.beliefs.identity.agent_type = AgentType.CONTROLLER
+    controller.beliefs.identity.group_type = GroupType.CAMPUS
+    controller.beta = GROUP_BETA[GroupType.CAMPUS]
+
+    model.topic_heat["T001"] = {g: 0.0 for g in GroupType}
+    model.topic_heat["T001"][GroupType.CAMPUS] = 1.0
+    model.intervention_tick[GroupType.CAMPUS] = None
+    model.schedule.time = 0
+    model._update_environment()
+
+    expected = math.exp(-ALPHA) * math.exp(-GROUP_BETA[GroupType.CAMPUS])
+    actual = model.topic_heat["T001"][GroupType.CAMPUS]
+    assert model.intervention_tick[GroupType.CAMPUS] == 0
+    assert abs(actual - expected) < 1e-9, \
+        f"干预应在触发 tick 立即生效，actual={actual}, expected={expected}"
+
+
+def _test_macro_spread_separate_from_forward():
+    """宏观热度扩散只记 cross_group_spread，不得污染 Agent 转发数。"""
+    from types_def import SimConfig, GroupType
+    from opinion_model import OpinionModel
+
+    model = OpinionModel(SimConfig(
+        n_agents=4,
+        network_params={"m": 1, "cross_group_spread_probability": 1.0},
+        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+    ))
+    model.topic_heat["T001"] = {g: 0.0 for g in GroupType}
+    model.topic_heat["T001"][GroupType.DORM] = 1.0
+    model._update_environment()
+
+    assert model.cross_group_spread > 0, "概率为 1 时应发生宏观跨群热度扩散"
+    assert model.cross_group_forward == 0, \
+        "没有 Agent FORWARD 时，cross_group_forward 必须保持 0"
 
 
 def _test_model_single_node():
@@ -410,8 +578,12 @@ if __name__ == "__main__":
 
     print("\n── [A]  OpinionModel 核心流程（v2）")
     _check("DataCollector 含§5全部指标列",     _test_model_datacollector_format)
-    _check("submit_action 写缓存+热度+负面度", _test_model_submit_action_v2)
+    _check("submit_action 写缓存+热度+真实跨群转发", _test_model_submit_action_v2)
+    _check("异群可见消息可形成带 target_id 的 FORWARD", _test_cross_group_visibility_and_forward_target)
     _check("_update_environment 热度衰减≥0",   _test_model_update_environment)
+    _check("各群按自身 β 衰减（CAMPUS 最快）", _test_group_specific_heat_decay)
+    _check("干预衰减在触发 tick 立即生效", _test_intervention_applies_same_tick)
+    _check("宏观扩散与 Agent 转发指标分离", _test_macro_spread_separate_from_forward)
     _check("_place_agents 给每个 agent 分配 group_type", _test_model_place_agents_group_type)
     _check("n=1 单节点 5步不崩溃",             _test_model_single_node)
 

@@ -21,6 +21,8 @@ group_type_ratio:
 network_type: "barabasi_albert"
 network_params:
   m: 3            # n=1 时会自动退化为单节点图
+  cross_group_visibility: 0.10
+  cross_group_spread_probability: 0.15
 
 n_steps: 5        # 跑5步即可，验证循环不崩
 

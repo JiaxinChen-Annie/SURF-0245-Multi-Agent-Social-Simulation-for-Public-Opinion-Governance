@@ -27,6 +27,8 @@ group_type_ratio:
 network_type: "barabasi_albert"   # 无标度网络（幂律分布，类似真实社交网络）
 network_params:
   m: 3                             # 每个新节点连接 m 条边
+  cross_group_visibility: 0.10     # 异群消息进入当前 Agent 感知流的概率
+  cross_group_spread_probability: 0.15  # 宏观热度向其他群扩散的概率
 
 n_steps: 50
 
