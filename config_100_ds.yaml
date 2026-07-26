@@ -1,0 +1,46 @@
+# 100 agents · 真 DeepSeek · 建议先 20 步（再考虑加到 30）
+#
+# 原因：每 tick Hawkes 约激活 10%~80% agent，每人一步都可能调 LLM。
+#   100×20 ≈ 约 200~1600 次 API（视激活率），已够看趋势与 BDI 稳定性。
+#   100×50 全真 Key 可能要数小时且费用高，不建议第一次就跑。
+#
+# 用法：
+#   set DEEPSEEK_API_KEY=你的key
+#   python run_sim.py --config config_100_ds.yaml
+
+n_agents: 100
+
+agent_type_ratio:
+  ORDINARY:    0.70
+  ACTIVE:      0.10
+  RATIONAL:    0.10
+  CONTROLLER:  0.10
+
+group_type_ratio:
+  DORM:   0.25
+  CLASS:  0.35
+  MAJOR:  0.25
+  CAMPUS: 0.15
+
+network_type: "barabasi_albert"
+network_params:
+  m: 3
+
+n_steps: 20
+
+hawkes_params:
+  mu:    0.1
+  alpha: 0.5
+  beta:  1.0
+
+llm_config:
+  provider: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com
+  timeout: 60
+  max_retries: 2
+  temperature: 0.2
+  thinking: false
+  fallback_mock: true   # 失败降级，保证压力测试不崩
+
+random_seed: 42

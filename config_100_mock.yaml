@@ -1,0 +1,30 @@
+# 100 agents · mock LLM · 压力/稳定性基线（先跑这个）
+n_agents: 100
+
+agent_type_ratio:
+  ORDINARY:    0.70
+  ACTIVE:      0.10
+  RATIONAL:    0.10
+  CONTROLLER:  0.10
+
+group_type_ratio:
+  DORM:   0.25
+  CLASS:  0.35
+  MAJOR:  0.25
+  CAMPUS: 0.15
+
+network_type: "barabasi_albert"
+network_params:
+  m: 3
+
+n_steps: 50
+
+hawkes_params:
+  mu:    0.1
+  alpha: 0.5
+  beta:  1.0
+
+llm_config:
+  provider: mock
+
+random_seed: 42

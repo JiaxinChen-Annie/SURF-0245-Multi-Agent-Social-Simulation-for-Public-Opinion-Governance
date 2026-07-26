@@ -1,0 +1,30 @@
+{
+  "config_path": "E:\\SURF\\SURF C\\联调_ABCDE\\config_100_ds.yaml",
+  "n_agents": 100,
+  "n_steps": 20,
+  "network_type": "barabasi_albert",
+  "random_seed": 42,
+  "llm_provider": "deepseek",
+  "llm_model": "deepseek-v4-flash",
+  "init_seconds": 2.7991,
+  "run_seconds": 1684.823,
+  "total_seconds": 1687.6221,
+  "seconds_per_step": 84.241151,
+  "step_seconds_mean": 84.240527,
+  "step_seconds_max": 95.516112,
+  "step_seconds_min": 33.551563,
+  "all_pass": false,
+  "final_metrics": {
+    "tick": 19.0,
+    "avg_opinion": -0.052809069547900434,
+    "polarization": 0.9618196615308225,
+    "emotional_contagion": 0.017173602803182714,
+    "message_count": 111.0,
+    "negative_emotion": 0.87,
+    "distortion_level": 0.0725,
+    "cross_group_forward": 29.0,
+    "intervention_tick": 0.0,
+    "recovery_time": 0.0,
+    "step_seconds": 83.34666940011084
+  }
+}
