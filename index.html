@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ABCDE 联调压力测试 · 交互报告</title>
+  <meta name="description" content="Mock vs DeepSeek 交互式实验报告" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Noto+Sans+SC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --ink: #15202b;
+      --muted: #667788;
+      --line: #e2e8ee;
+      --bg: #f3f5f7;
+      --card: #ffffff;
+      --accent: #0d7377;
+      --mock: #6b7c93;
+      --ds: #1a7fbf;
+      --ds2: #c45c26;
+      --neg: #b33b4a;
+      --max: 1100px;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "Noto Sans SC", system-ui, sans-serif;
+      font-size: 15.5px;
+      line-height: 1.65;
+      background: var(--bg);
+    }
+    .wrap { width: min(var(--max), calc(100% - 2rem)); margin: 0 auto; padding: 2rem 0 4rem; }
+
+    header.hero {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.75rem 1.75rem 1.4rem;
+      margin-bottom: 1.25rem;
+    }
+    .eyebrow {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin: 0 0 0.55rem;
+      letter-spacing: 0.03em;
+    }
+    h1 {
+      font-family: "Instrument Serif", "Noto Sans SC", serif;
+      font-weight: 400;
+      font-size: clamp(1.85rem, 3.8vw, 2.55rem);
+      line-height: 1.2;
+      margin: 0 0 0.6rem;
+      letter-spacing: -0.02em;
+    }
+    .lead { margin: 0; color: var(--muted); max-width: 46rem; }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 1rem; }
+    .chip {
+      font-size: 0.78rem; padding: 0.25rem 0.65rem; border-radius: 999px;
+      background: #eef2f5; color: var(--muted); border: 1px solid var(--line);
+    }
+    .chip.on { background: #e4f3f3; color: var(--accent); border-color: #c5e4e4; }
+
+    nav.toc {
+      display: flex; flex-wrap: wrap; gap: 0.35rem 1rem;
+      padding: 0.7rem 0.2rem 1.1rem; font-size: 0.86rem;
+    }
+    nav.toc a { color: var(--muted); text-decoration: none; }
+    nav.toc a:hover { color: var(--accent); }
+
+    section { margin-bottom: 1.75rem; }
+    h2 {
+      font-family: "Instrument Serif", "Noto Sans SC", serif;
+      font-weight: 400; font-size: 1.55rem; margin: 0 0 0.85rem;
+    }
+    h3 { font-size: 1rem; margin: 1.2rem 0 0.5rem; }
+    p { margin: 0 0 0.8rem; }
+    ul { margin: 0 0 0.9rem; padding-left: 1.15rem; }
+
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.15rem 1.25rem;
+    }
+    .callout {
+      border-left: 3px solid var(--accent);
+      background: #f4fbfb;
+      padding: 0.85rem 1rem;
+      border-radius: 0 10px 10px 0;
+      margin: 0.8rem 0 0;
+      color: #345;
+      font-size: 0.92rem;
+    }
+
+    .stats {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; margin-bottom: 1rem;
+    }
+    @media (max-width: 800px) { .stats { grid-template-columns: 1fr 1fr; } }
+    .stat {
+      background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+      padding: 0.95rem 1rem;
+    }
+    .stat .v { font-family: "IBM Plex Mono", monospace; font-size: 1.12rem; font-weight: 500; }
+    .stat .l { font-size: 0.75rem; color: var(--muted); margin-top: 0.2rem; }
+
+    table {
+      width: 100%; border-collapse: collapse; font-size: 0.88rem;
+      background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+      overflow: hidden;
+    }
+    th, td { padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #eef2f5; color: var(--muted); font-weight: 500; font-size: 0.78rem; }
+    tr:last-child td { border-bottom: 0; }
+    .mono { font-family: "IBM Plex Mono", monospace; font-size: 0.82rem; }
+
+    .hint {
+      font-size: 0.82rem; color: var(--muted); margin: 0 0 0.9rem;
+    }
+    .hint kbd {
+      font-family: "IBM Plex Mono", monospace; font-size: 0.75rem;
+      background: #eef2f5; border: 1px solid var(--line); border-radius: 4px; padding: 0.05rem 0.35rem;
+    }
+
+    .chart-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 0.9rem;
+    }
+    @media (max-width: 860px) { .chart-grid { grid-template-columns: 1fr; } }
+    .chart-card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1rem 1rem 0.65rem;
+    }
+    .chart-card.wide { grid-column: 1 / -1; }
+    .chart-card h3 {
+      margin: 0 0 0.15rem; font-size: 0.98rem; font-weight: 700;
+    }
+    .chart-sub {
+      margin: 0 0 0.55rem; font-size: 0.75rem; color: var(--muted);
+      font-family: "IBM Plex Mono", monospace;
+    }
+    .chart-box { position: relative; height: 250px; }
+    .chart-box.tall { height: 280px; }
+    .chart-note {
+      margin: 0.75rem 0 0.25rem;
+      padding: 0.7rem 0.8rem;
+      background: #f7f9fb;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      font-size: 0.82rem;
+      line-height: 1.55;
+      color: #3a4a5a;
+    }
+    .chart-note .k {
+      display: block;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.7rem;
+      color: var(--accent);
+      letter-spacing: 0.02em;
+      margin-bottom: 0.2rem;
+    }
+    .chart-note p { margin: 0 0 0.45rem; }
+    .chart-note p:last-child { margin-bottom: 0; }
+
+    footer {
+      margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--line);
+      color: var(--muted); font-size: 0.82rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header class="hero">
+      <p class="eyebrow">SURF-0245 · ABCDE 联调 · 交互报告 · 2026-07-26</p>
+      <h1>Mock 与 DeepSeek 对比实验</h1>
+      <p class="lead">
+        悬停曲线可查看每一步精确数值。对比窗口为 tick 0–19（DeepSeek 全长；Mock 取前 20 步对齐）。
+      </p>
+      <div class="chips">
+        <span class="chip on">可交互图表</span>
+        <span class="chip">100 Agents</span>
+        <span class="chip">Mock × 50 · DeepSeek × 20</span>
+        <span class="chip">seed = 42</span>
+      </div>
+    </header>
+
+    <nav class="toc">
+      <a href="#curves">演化曲线</a>
+      <a href="#perf">性能</a>
+      <a href="#table">末态表</a>
+      <a href="#analysis">分析</a>
+      <a href="#conclusion">结论</a>
+    </nav>
+
+    <section id="curves">
+      <h2>6. 演化曲线（tick 0–19）</h2>
+      <div class="chart-grid">
+        <div class="chart-card">
+          <h3>平均观点 avg_opinion</h3>
+          <p class="chart-sub">Y: 观点均值 ∈ [-1, 1] · X: 仿真步 tick</p>
+          <div class="chart-box"><canvas id="cOpinion"></canvas></div>
+          <div class="chart-note">
+            <span class="k">构成含义</span>
+            <p>纵轴是全体 agent 对主话题观点的算术平均：−1 强烈反对，0 中立，+1 强烈支持。两条曲线分别是 Mock 与 DeepSeek 在相同种子下的时序。</p>
+            <span class="k">数据解读</span>
+            <p>Mock 全程钉在约 +0.043，说明 MockLLM 几乎不改信念。DeepSeek 由约 +0.024 很快转为负值，末态约 −0.053：均值仍接近零，但已出现可观测的轻微负向漂移，证明真 LLM 路径在更新观点。</p>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>观点极化 polarization</h3>
+          <p class="chart-sub">Y: 观点标准差（极化程度） · X: tick</p>
+          <div class="chart-box"><canvas id="cPol"></canvas></div>
+          <div class="chart-note">
+            <span class="k">构成含义</span>
+            <p>纵轴是观点分布的标准差。数值越高，群体内部意见越分裂（有人很正、有人很负），不等于“全体都更负面”。</p>
+            <span class="k">数据解读</span>
+            <p>Mock 钉在约 0.60。DeepSeek 由约 0.64 持续升至约 0.96：结合上图均值几乎贴零，说明不是一边倒共识，而是<strong>两极分化加剧</strong>。这是真 Key 相对 Mock 最显著的差异之一。</p>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>负面情绪占比 negative_emotion</h3>
+          <p class="chart-sub">Y: valence &lt; 0 的 agent 比例 · X: tick</p>
+          <div class="chart-box"><canvas id="cNeg"></canvas></div>
+          <div class="chart-note">
+            <span class="k">构成含义</span>
+            <p>统计 valence（情绪效价）小于 0 的 agent 占总人数比例。反映“有多少人处于偏负情绪”，不是观点均值本身。</p>
+            <span class="k">数据解读</span>
+            <p>Mock 仅从 0.49 缓升到约 0.58。DeepSeek 从 0.49 升到约 0.87，即近九成 agent 情绪偏负。提示 LLM 的 emotion_delta 偏负较强；写报告时应区分“情绪负面”与“观点共识”。</p>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>近窗消息量 message_count</h3>
+          <p class="chart-sub">Y: 信息流近窗长度（非累计） · X: tick</p>
+          <div class="chart-box"><canvas id="cMsg"></canvas></div>
+          <div class="chart-note">
+            <span class="k">构成含义</span>
+            <p>纵轴是环境信息流缓存中当前仍有效的消息条数（有过期淘汰），不是从开局到现在的累计发帖总量。上升表示讨论变活跃，回落常因旧消息过期。</p>
+            <span class="k">数据解读</span>
+            <p>早期两条曲线接近（如 tick0 都是 4）。随后都先升后略降：Mock 峰约 162、tick19 约 151；DeepSeek 峰约 138、tick19 约 111。说明传播层骨架相似，DeepSeek 并未额外制造“消息爆炸”，差异更多在认知—情绪层。</p>
+          </div>
+        </div>
+        <div class="chart-card wide">
+          <h3>跨群累计 cross_group_forward</h3>
+          <p class="chart-sub">两条实验在 seed=42 下完全重合（热度溅射代理）</p>
+          <div class="chart-box tall"><canvas id="cCross"></canvas></div>
+          <div class="chart-note">
+            <span class="k">构成含义</span>
+            <p>指标名含“转发”，但当前实现里该累计值主要来自：某群热度 H≥θ 后，按概率把热度溅射到其他群并 +1。不是“某个 agent 把消息发到另一群”的微观转发次数。</p>
+            <span class="k">数据解读</span>
+            <p>Mock 与 DeepSeek 在 tick 0–19 <strong>逐点相同</strong>（2→29），因为同种子下环境热度溅射的随机过程一致，与 LLM 几乎无关。因此它能证明“跨群热度溢出机制在跑”，不能单独当作多层群聊真实转发链的证据。Mock 若跑满 50 步，该值会继续累加到约 94。</p>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>近窗失真 distortion_level</h3>
+          <p class="chart-sub">Y: 近窗失真均值 · X: tick</p>
+          <div class="chart-box"><canvas id="cDist"></canvas></div>
+          <div class="chart-note">
+            <span class="k">构成含义</span>
+            <p>对信息流中最近若干条消息的 distortion_level 取平均。forward / paraphrase / exaggerate 等消息类型会抬高失真；clarification 通常较低。</p>
+            <span class="k">数据解读</span>
+            <p>Mock 长期接近 0–0.01。DeepSeek 中段出现尖峰（约 tick10–11 达 0.11 左右），末态约 0.07，整体仍不高。说明真模型路径下偶发更高失真内容，但尚未形成持续高失真主导。</p>
+          </div>
+        </div>
+        <div class="chart-card">
+          <h3>每步耗时 step_seconds</h3>
+          <p class="chart-sub">Y: 秒 · 注意两侧量级差三个数量级</p>
+          <div class="chart-box"><canvas id="cTime"></canvas></div>
+          <div class="chart-note">
+            <span class="k">构成含义</span>
+            <p>每一仿真步的墙钟耗时（秒）。反映该步内调度、agent 决策（含可能的 API 调用）与数据采集的总成本。</p>
+            <span class="k">数据解读</span>
+            <p>Mock 约 0.01–0.02 秒/步，几乎贴零轴。DeepSeek 第 0 步约 34 秒，其后稳定在约 82–96 秒/步，总时长约 28 分钟。量级差来自同步调用 DeepSeek API，属于预期成本，不能用 Mock 的“&lt;30 秒验收”去否定真 Key 实验。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="perf">
+      <h2>运行性能</h2>
+      <div class="stats">
+        <div class="stat"><div class="v">0.84 s</div><div class="l">Mock 总墙钟时间</div></div>
+        <div class="stat"><div class="v">28.1 min</div><div class="l">DeepSeek 总墙钟时间</div></div>
+        <div class="stat"><div class="v">0.017 s/step</div><div class="l">Mock 平均步耗时</div></div>
+        <div class="stat"><div class="v">84.2 s/step</div><div class="l">DeepSeek 平均步耗时</div></div>
+      </div>
+    </section>
+
+    <section id="table">
+      <h2>重叠窗口末态（tick = 19）</h2>
+      <div class="panel" style="padding:0; overflow:auto;">
+        <table>
+          <thead>
+            <tr><th>指标</th><th>Mock</th><th>DeepSeek</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td class="mono">avg_opinion</td><td>0.043</td><td>−0.053</td><td>Mock 冻结；DS 略偏负</td></tr>
+            <tr><td class="mono">polarization</td><td>0.601</td><td>0.962</td><td>DS 极化显著升高</td></tr>
+            <tr><td class="mono">negative_emotion</td><td>0.58</td><td>0.87</td><td>DS 更负</td></tr>
+            <tr><td class="mono">message_count</td><td>151</td><td>111</td><td>近窗存量</td></tr>
+            <tr><td class="mono">cross_group_forward</td><td>29</td><td>29</td><td>轨迹相同</td></tr>
+            <tr><td class="mono">distortion_level</td><td>0.0025</td><td>0.0725</td><td>DS 略高</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="analysis">
+      <h2>结果分析</h2>
+      <div class="panel">
+        <p>联调骨架已验证：两类实验均完整产出指标且无 NaN。Mock 适合秒级验收；DeepSeek 证明真实 LLM 可改变信念与情绪。</p>
+        <p>Mock 观点/极化全程钉死；DeepSeek 极化与负面情绪明显上升——差异主要在认知—情绪层，消息活跃形态仍相近。</p>
+        <div class="callout">
+          <strong>跨群注意：</strong>tick 0–19 的 cross_group_forward 逐点相同，当前实现主要是热度溅射计数，不是「一人把消息转到另一群」的微观转发链。
+        </div>
+      </div>
+    </section>
+
+    <section id="conclusion">
+      <h2>结论</h2>
+      <div class="panel">
+        <ul>
+          <li>100 agent 规模下 ABCDE 联调可稳定跑通；</li>
+          <li>DeepSeek 在约 28 分钟 / 20 步下产生可观测演化；</li>
+          <li>大模型主要拉动认知—情绪层；跨群微观机制仍待补强。</li>
+        </ul>
+        <p style="margin:0;font-size:0.88rem;color:var(--muted);">
+          文字版：<a href="实验报告_Mock与DeepSeek对比.md">实验报告_Mock与DeepSeek对比.md</a>
+          · 原始 CSV：<span class="mono">output_mock_100x50/</span>、<span class="mono">output_ds_100x20/</span>
+        </p>
+      </div>
+    </section>
+
+    <footer>
+      本地打开即可交互，无需服务器。若图片/字体 CDN 受限，图表仍可用（Chart.js 需联网加载一次）。
+    </footer>
+  </div>
+
+  <script>
+    const ticks = Array.from({ length: 20 }, (_, i) => i);
+
+    const mock = {
+      opinion: Array(20).fill(0.043),
+      pol: Array(20).fill(0.601),
+      neg: [0.49,0.49,0.49,0.49,0.49,0.49,0.49,0.49,0.49,0.51,0.52,0.55,0.55,0.55,0.56,0.56,0.57,0.57,0.57,0.58],
+      msg: [4,19,35,48,61,75,83,96,114,126,142,157,158,156,157,155,155,162,157,151],
+      cross: [2,3,4,6,7,12,14,16,16,17,19,23,24,24,25,26,27,29,29,29],
+      dist: [0.0125,0.0053,0.0075,0.01,0.005,0.005,0.0025,0.005,0.005,0.005,0.0075,0.0025,0.0075,0.0025,0.0025,0.005,0,0,0,0.0025],
+      time: [0.0048,0.0109,0.0126,0.0142,0.0161,0.0186,0.0169,0.0171,0.0185,0.0163,0.0186,0.0163,0.0184,0.0173,0.0166,0.0175,0.0157,0.0162,0.0176,0.0179],
+    };
+
+    const ds = {
+      opinion: [0.0237,-0.0176,-0.0165,-0.0131,-0.0169,-0.0183,-0.0246,-0.0303,-0.0431,-0.0403,-0.0419,-0.0448,-0.0580,-0.0644,-0.0549,-0.0554,-0.0600,-0.0590,-0.0518,-0.0528],
+      pol: [0.639,0.742,0.799,0.853,0.874,0.909,0.921,0.923,0.922,0.926,0.933,0.936,0.942,0.939,0.953,0.957,0.958,0.959,0.963,0.962],
+      neg: [0.49,0.49,0.51,0.55,0.62,0.66,0.70,0.76,0.81,0.85,0.86,0.86,0.89,0.90,0.90,0.89,0.88,0.90,0.86,0.87],
+      msg: [4,19,33,45,56,65,75,87,100,113,125,138,134,129,123,120,120,123,115,111],
+      cross: [2,3,4,6,7,12,14,16,16,17,19,23,24,24,25,26,27,29,29,29],
+      dist: [0.0125,0.0053,0.0075,0.01,0.005,0.005,0.0075,0.0075,0.04,0.0475,0.115,0.1075,0.045,0.08,0.075,0.0375,0.0375,0.0375,0.0725,0.0725],
+      time: [33.55,85.73,95.52,92.37,86.86,86.32,83.08,83.91,86.10,88.24,88.75,87.07,88.45,90.12,84.17,86.10,87.81,85.31,82.00,83.35],
+    };
+
+    const C_MOCK = "#6b7c93";
+    const C_DS = "#1a7fbf";
+    const C_DS2 = "#c45c26";
+
+    function series(label, data, color) {
+      return {
+        label,
+        data,
+        borderColor: color,
+        backgroundColor: color + "22",
+        borderWidth: 2.25,
+        pointRadius: 0,
+        pointHoverRadius: 5,
+        pointHoverBorderWidth: 2,
+        pointHoverBackgroundColor: "#fff",
+        pointHoverBorderColor: color,
+        tension: 0.22,
+      };
+    }
+
+    function makeChart(canvasId, yTitle, datasets, yMin, yMax, beginAtZero) {
+      const ctx = document.getElementById(canvasId);
+      return new Chart(ctx, {
+        type: "line",
+        data: { labels: ticks, datasets },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: {
+              position: "bottom",
+              labels: { usePointStyle: true, pointStyle: "circle", boxWidth: 8, padding: 16, font: { size: 12 } },
+            },
+            tooltip: {
+              backgroundColor: "rgba(255,255,255,0.96)",
+              titleColor: "#15202b",
+              bodyColor: "#334",
+              borderColor: "#d5dde6",
+              borderWidth: 1,
+              padding: 10,
+              displayColors: true,
+              callbacks: {
+                title: (items) => String(items[0].label),
+                label: (ctx) => {
+                  const v = ctx.parsed.y;
+                  const s = Math.abs(v) >= 10 ? v.toFixed(2) : (Math.abs(v) >= 1 ? v.toFixed(3) : v.toFixed(4));
+                  return ` ${ctx.dataset.label}: ${s}`;
+                },
+              },
+            },
+          },
+          scales: {
+            x: {
+              title: { display: true, text: "仿真步 tick", color: "#667788", font: { size: 11 } },
+              grid: { color: "rgba(0,0,0,0.04)" },
+              ticks: { color: "#667788", maxTicksLimit: 8 },
+            },
+            y: {
+              beginAtZero: !!beginAtZero,
+              min: yMin,
+              max: yMax,
+              title: { display: true, text: yTitle, color: "#667788", font: { size: 11 } },
+              grid: { color: "rgba(0,0,0,0.06)" },
+              ticks: { color: "#667788" },
+            },
+          },
+        },
+      });
+    }
+
+    makeChart("cOpinion", "观点均值 ∈ [-1, 1]", [
+      series("Mock", mock.opinion, C_MOCK),
+      series("DeepSeek", ds.opinion, C_DS),
+    ], -0.08, 0.08, false);
+
+    makeChart("cPol", "观点标准差（极化程度）", [
+      series("Mock", mock.pol, C_MOCK),
+      series("DeepSeek", ds.pol, C_DS2),
+    ], 0.5, 1.05, false);
+
+    makeChart("cNeg", "负面情绪占比", [
+      series("Mock", mock.neg, C_MOCK),
+      series("DeepSeek", ds.neg, "#b33b4a"),
+    ], 0.4, 1.0, false);
+
+    makeChart("cMsg", "近窗消息量", [
+      series("Mock", mock.msg, C_MOCK),
+      series("DeepSeek", ds.msg, C_DS),
+    ], 0, undefined, true);
+
+    makeChart("cCross", "跨群累计次数", [
+      series("Mock & DeepSeek（重合）", mock.cross, C_DS),
+    ], 0, undefined, true);
+
+    makeChart("cDist", "失真水平", [
+      series("Mock", mock.dist, C_MOCK),
+      series("DeepSeek", ds.dist, C_DS2),
+    ], 0, undefined, true);
+
+    makeChart("cTime", "秒 / step", [
+      series("Mock", mock.time, C_MOCK),
+      series("DeepSeek", ds.time, C_DS),
+    ], 0, undefined, true);
+  </script>
+</body>
+</html>
