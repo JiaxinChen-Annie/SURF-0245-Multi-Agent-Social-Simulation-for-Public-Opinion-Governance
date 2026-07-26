@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Noto+Sans+SC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"></script>
+  <script src="vendor/chart.umd.min.js"></script>
   <style>
     :root {
       --ink: #15202b;
@@ -179,11 +179,7 @@
     <header class="hero">
       <p class="eyebrow">SURF-0245 · ABCDE 联调 · 交互报告 · 2026-07-26</p>
       <h1>Mock 与 DeepSeek 对比实验</h1>
-      <p class="lead">
-        悬停曲线可查看每一步精确数值。对比窗口为 tick 0–19（DeepSeek 全长；Mock 取前 20 步对齐）。
-      </p>
       <div class="chips">
-        <span class="chip on">可交互图表</span>
         <span class="chip">100 Agents</span>
         <span class="chip">Mock × 50 · DeepSeek × 20</span>
         <span class="chip">seed = 42</span>
@@ -337,11 +333,16 @@
     </section>
 
     <footer>
-      本地打开即可交互，无需服务器。若图片/字体 CDN 受限，图表仍可用（Chart.js 需联网加载一次）。
+      图表库已内置在 <span class="mono">vendor/chart.umd.min.js</span>，本地打开无需访问外网 CDN。
     </footer>
   </div>
 
   <script>
+    if (typeof Chart === "undefined") {
+      document.querySelectorAll(".chart-box").forEach((el) => {
+        el.innerHTML = "<p style='padding:1rem;color:#b33b4a;font-size:0.9rem;'>图表脚本未加载。请确认同目录存在 vendor/chart.umd.min.js，并用浏览器直接打开本文件。</p>";
+      });
+    } else {
     const ticks = Array.from({ length: 20 }, (_, i) => i);
 
     const mock = {
@@ -386,6 +387,14 @@
 
     function makeChart(canvasId, yTitle, datasets, yMin, yMax, beginAtZero) {
       const ctx = document.getElementById(canvasId);
+      const yScale = {
+        beginAtZero: !!beginAtZero,
+        title: { display: true, text: yTitle, color: "#667788", font: { size: 11 } },
+        grid: { color: "rgba(0,0,0,0.06)" },
+        ticks: { color: "#667788" },
+      };
+      if (yMin !== undefined && yMin !== null) yScale.min = yMin;
+      if (yMax !== undefined && yMax !== null) yScale.max = yMax;
       return new Chart(ctx, {
         type: "line",
         data: { labels: ticks, datasets },
@@ -422,14 +431,7 @@
               grid: { color: "rgba(0,0,0,0.04)" },
               ticks: { color: "#667788", maxTicksLimit: 8 },
             },
-            y: {
-              beginAtZero: !!beginAtZero,
-              min: yMin,
-              max: yMax,
-              title: { display: true, text: yTitle, color: "#667788", font: { size: 11 } },
-              grid: { color: "rgba(0,0,0,0.06)" },
-              ticks: { color: "#667788" },
-            },
+            y: yScale,
           },
         },
       });
@@ -453,21 +455,22 @@
     makeChart("cMsg", "近窗消息量", [
       series("Mock", mock.msg, C_MOCK),
       series("DeepSeek", ds.msg, C_DS),
-    ], 0, undefined, true);
+    ], 0, null, true);
 
     makeChart("cCross", "跨群累计次数", [
       series("Mock & DeepSeek（重合）", mock.cross, C_DS),
-    ], 0, undefined, true);
+    ], 0, null, true);
 
     makeChart("cDist", "失真水平", [
       series("Mock", mock.dist, C_MOCK),
       series("DeepSeek", ds.dist, C_DS2),
-    ], 0, undefined, true);
+    ], 0, null, true);
 
     makeChart("cTime", "秒 / step", [
       series("Mock", mock.time, C_MOCK),
       series("DeepSeek", ds.time, C_DS),
-    ], 0, undefined, true);
+    ], 0, null, true);
+    } // end Chart available
   </script>
 </body>
 </html>
