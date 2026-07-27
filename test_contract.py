@@ -6,12 +6,13 @@ test_contract.py — 接口契约验证脚本（v2，W4）
   - ActionType: SEND_MESSAGE/REPLY/FORWARD/SILENT（移除 LIKE）
   - GroupType: DORM/CLASS/MAJOR/CAMPUS
   - MessageType 字符串常量
-  - ActionRecord 新增字段检查（topic_id/distortion_level/message_type/negative_score/heat）
+  - ActionRecord 新增内容字段与消息/群路由字段检查
   - submit_action 新增 topic_heat/topic_negative/cross_group_forward 检查
   - SocialAgent.__init__ 新增 group_type 参数验证
   - calc_heat_decay 接口验证（#11）
   - Perception 新增字段检查
-  - 跨群可见、FORWARD target_id、微观/宏观计数分离回归测试
+  - 多群成员、真实源消息转发、目标群投递、LLM 行动执行回归测试
+  - 微观 cross_group_forward / 宏观 cross_group_spread 计数分离
   - 各群 β 与干预触发 tick 的热度公式回归测试
 
 用法：python3 test_contract.py
@@ -94,6 +95,10 @@ def _test_types_import():
     assert hasattr(rec, "message_type"),     "ActionRecord 缺少 message_type"
     assert hasattr(rec, "negative_score"),   "ActionRecord 缺少 negative_score"
     assert hasattr(rec, "heat"),             "ActionRecord 缺少 heat"
+    assert hasattr(rec, "message_id")
+    assert hasattr(rec, "group_id")
+    assert hasattr(rec, "source_message_id")
+    assert hasattr(rec, "source_group_id")
 
     # Perception v2 字段
     p = Perception()
@@ -104,6 +109,8 @@ def _test_types_import():
     assert not hasattr(p, "neighbor_actions"), "neighbor_actions 已重命名"
     assert hasattr(p, "topic_heat"),      "Perception 缺少 topic_heat"
     assert hasattr(p, "topic_negative"),  "Perception 缺少 topic_negative"
+    assert hasattr(p, "group_ids"),       "Perception 缺少多群成员列表 group_ids"
+    assert hasattr(p, "topic_heat_by_group")
 
     # SocialInfo v2 字段
     si = SocialInfo()
@@ -114,14 +121,23 @@ def _test_types_import():
     assert hasattr(si, "distortion_level"), "SocialInfo 缺少 distortion_level"
     assert hasattr(si, "negative_score"),   "SocialInfo 缺少 negative_score"
     assert hasattr(si, "heat"),             "SocialInfo 缺少 heat"
+    assert hasattr(si, "message_id")
+    assert hasattr(si, "group_id")
+    assert hasattr(si, "source_message_id")
+    assert hasattr(si, "source_group_id")
 
     # Desire / Intention v2 字段
     d = Desire()
     assert hasattr(d, "topic_id"),  "Desire 缺少 topic_id"
     assert hasattr(d, "target_id"), "Desire 缺少 target_id"
+    assert hasattr(d, "destination_group_id")
+    assert hasattr(d, "source_message_id")
     assert not hasattr(d, "event_id"), "Desire 不应有 event_id"
     it = Intention()
     assert hasattr(it, "topic_id"), "Intention 缺少 topic_id"
+    assert hasattr(it, "destination_group_id")
+    assert hasattr(it, "source_message_id")
+    assert hasattr(it, "message_type")
     assert not hasattr(it, "event_id"), "Intention 不应有 event_id"
 
 
@@ -208,6 +224,8 @@ def _test_agent_attributes_v2():
     assert hasattr(agent.beliefs, "psychology")
     assert hasattr(agent, "pending_action")
     assert hasattr(agent.beliefs.identity, "group_type"), "IdentityBelief 缺少 group_type"
+    assert hasattr(agent.beliefs.identity, "group_ids"), "IdentityBelief 缺少 group_ids"
+    assert hasattr(agent.beliefs.identity, "primary_group_id")
     assert hasattr(agent.beliefs.identity, "nickname"),   "IdentityBelief 缺少 nickname"
     assert hasattr(agent, "beta"),                        "SocialAgent 缺少 beta 属性"
 
@@ -310,88 +328,83 @@ def _test_model_datacollector_format():
     assert (df["distortion_level"] >= 0).all()
 
 
-def _test_model_submit_action_v2():
-    """submit_action 更新热度，并按 ActionType 统计真实跨群转发。"""
-    from types_def import (
-        SimConfig, ActionRecord, ActionType, MessageType,
-        GroupType, GROUP_BETA,
-    )
+def _routing_fixture():
+    from types_def import SimConfig, GroupType
     from opinion_model import OpinionModel
+
     model = OpinionModel(SimConfig(
-        n_agents=2,
+        n_agents=20,
+        network_params={
+            "m": 1,
+            "group_membership_mode": "hierarchical",
+            "forward_destination_strategy": "next_larger",
+            "cross_group_spread_probability": 0.0,
+        },
         hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+        random_seed=42,
     ))
-    agents = list(model.schedule.agents)
-    src_agent, origin_agent = agents[0], agents[1]
-    src_agent.beliefs.identity.group_type = GroupType.CLASS
-    src_agent.beta = GROUP_BETA[GroupType.CLASS]
-    origin_agent.beliefs.identity.group_type = GroupType.DORM
-    origin_agent.beta = GROUP_BETA[GroupType.DORM]
+    dorm_agents = [
+        agent for agent in model.schedule.agents
+        if agent.beliefs.identity.group_type == GroupType.DORM
+    ]
+    class_agents = [
+        agent for agent in model.schedule.agents
+        if agent.beliefs.identity.group_type == GroupType.CLASS
+    ]
+    assert len(dorm_agents) >= 2 and class_agents
+    return model, dorm_agents[0], dorm_agents[1], class_agents[0]
 
-    before_cache = len(model.info_stream_cache)
-    before_fwd   = model.cross_group_forward
 
-    r = ActionRecord(
-        agent_id=src_agent.unique_id,
+def _test_model_submit_action_v2():
+    """submit_action 按真实源消息与 source_group→destination_group 统计转发。"""
+    from types_def import ActionRecord, ActionType, MessageType, GroupType
+
+    model, origin, bridge, _ = _routing_fixture()
+    original = ActionRecord(
+        agent_id=origin.unique_id,
         action_type=ActionType.SEND_MESSAGE,
-        content="测试消息",
-        topic_id="T001",          # v2：topic_id 而非 event_id
-        distortion_level=0.1,
+        content="宿舍群原始消息",
+        topic_id="T001",
+        distortion_level=0.0,
         message_type=MessageType.ORIGINAL,
         negative_score=0.2,
         heat=0.5,
         tick=0,
+        group_id="GROUP_DORM",
     )
-    model.submit_action(r)
+    assert model.submit_action(original)
+    assert original.message_id
 
-    assert len(model.info_stream_cache) == before_cache + 1, "缓存长度应 +1"
-    assert "T001" in model.topic_heat, "topic_heat 应含 T001"
-    assert "T001" in model.topic_negative, "topic_negative 应含 T001"
-
-    # heat 已更新（大于初始 0.0）
-    total_heat = sum(model.topic_heat["T001"].values())
-    assert total_heat > 0.0, "submit_action 后 topic_heat 应增加"
-
-    # 非 ACTIVE 角色也可能用 PARAPHRASE 表达转发，因此必须看 action_type。
-    fwd = ActionRecord(
-        agent_id=src_agent.unique_id,
+    before_forward = model.cross_group_forward
+    before_class_heat = model.topic_heat["T001"][GroupType.CLASS]
+    forwarded = ActionRecord(
+        agent_id=bridge.unique_id,
         action_type=ActionType.FORWARD,
-        content="转述异群消息",
-        target_id=origin_agent.unique_id,
+        content="转发到班级群",
+        target_id=origin.unique_id,
         topic_id="T001",
         distortion_level=0.25,
         message_type=MessageType.PARAPHRASE,
         negative_score=0.2,
         heat=0.2,
         tick=0,
+        group_id="GROUP_CLASS",
+        source_message_id=original.message_id,
     )
-    model.submit_action(fwd)
-    assert model.cross_group_forward == before_fwd + 1, \
-        "真实跨群 FORWARD 应计数，不能依赖 message_type=forward"
+    assert model.submit_action(forwarded)
+    assert forwarded.source_group_id == "GROUP_DORM"
+    assert forwarded.group_id == "GROUP_CLASS"
+    assert forwarded.target_id == origin.unique_id
+    assert model.cross_group_forward == before_forward + 1
+    assert model.topic_heat["T001"][GroupType.CLASS] > before_class_heat
 
 
-def _test_cross_group_visibility_and_forward_target():
-    """异群消息可见后，Agent 的 share 必须绑定原作者并形成实际跨群转发。"""
-    from types_def import (
-        SimConfig, AgentType, GroupType, GROUP_BETA,
-        ActionRecord, ActionType, MessageType,
-    )
-    from opinion_model import OpinionModel
+def _test_true_cross_group_delivery_and_rule_forward():
+    """小群原文不可见；桥接成员真实转发后，大群成员才看到新记录。"""
+    from types_def import AgentType, ActionRecord, ActionType, MessageType
 
-    model = OpinionModel(SimConfig(
-        n_agents=2,
-        network_params={"m": 1, "cross_group_visibility": 1.0},
-        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
-    ))
-    viewer, origin = list(model.schedule.agents)
-    viewer.beliefs.identity.agent_type = AgentType.ACTIVE
-    viewer.beliefs.identity.group_type = GroupType.CLASS
-    viewer.beta = GROUP_BETA[GroupType.CLASS]
-    origin.beliefs.identity.agent_type = AgentType.ORDINARY
-    origin.beliefs.identity.group_type = GroupType.DORM
-    origin.beta = GROUP_BETA[GroupType.DORM]
-
-    source_record = ActionRecord(
+    model, origin, bridge, class_viewer = _routing_fixture()
+    original = ActionRecord(
         agent_id=origin.unique_id,
         action_type=ActionType.SEND_MESSAGE,
         content="宿舍群里的原始消息",
@@ -399,37 +412,100 @@ def _test_cross_group_visibility_and_forward_target():
         message_type=MessageType.ORIGINAL,
         heat=0.2,
         tick=0,
+        group_id="GROUP_DORM",
     )
-    model.submit_action(source_record)
+    assert model.submit_action(original)
 
-    perception = viewer._perceive()
-    assert any(si.source_id == origin.unique_id for si in perception.recent_messages), \
-        "cross_group_visibility=1 时必须看到异群消息"
+    assert original.message_id not in {
+        record.message_id
+        for record in model.get_group_messages(class_viewer.unique_id)
+    }, "非 DORM 成员不应随机看到宿舍群原文"
 
-    viewer._last_perception = perception
-    viewer.beliefs.emotion.arousal = 0.5
-    viewer.beliefs.emotion.valence = 0.0
-    viewer.beliefs.psychology.personality.extraversion = 1.0
-    viewer.beliefs.psychology.risk_aversion = 0.0
+    bridge.beliefs.identity.agent_type = AgentType.ACTIVE
+    bridge.beliefs.emotion.arousal = 0.5
+    bridge.beliefs.emotion.valence = 0.0
+    bridge.beliefs.psychology.personality.extraversion = 1.0
+    bridge.beliefs.psychology.risk_aversion = 0.0
+    perception = bridge._perceive()
+    assert any(si.message_id == original.message_id for si in perception.recent_messages)
 
     original_random = model.random.random
-    model.random.random = lambda: 0.0  # 强制触发 share 与行动
+    model.random.random = lambda: 0.0
     try:
-        desires = viewer._infer_desires()
+        desires = bridge._infer_desires()
         share = next((d for d in desires if d.goal_type == "share"), None)
-        assert share is not None, "ACTIVE 在概率命中时应产生 share 欲望"
-        assert share.target_id == origin.unique_id, "share.target_id 应指向原消息作者"
+        assert share is not None
+        assert share.source_message_id == original.message_id
+        assert share.source_group_id == "GROUP_DORM"
+        assert share.destination_group_id == "GROUP_CLASS"
 
-        intention = viewer._plan_intentions(desires)
+        intention = bridge._plan_intentions(desires)
         assert intention.action_type == ActionType.FORWARD
-        assert intention.target_id == origin.unique_id
-
+        assert intention.destination_group_id == "GROUP_CLASS"
         before = model.cross_group_forward
-        viewer._execute_action(intention)
-        assert model.cross_group_forward == before + 1, \
-            "执行后应形成一条可追踪的实际跨群转发"
+        feedback = bridge._execute_action(intention)
+        assert feedback.get("submitted") == 1.0
+        assert model.cross_group_forward == before + 1
     finally:
         model.random.random = original_random
+
+    visible_after = model.get_group_messages(class_viewer.unique_id)
+    routed = [
+        record for record in visible_after
+        if record.action_type == ActionType.FORWARD
+        and record.source_message_id == original.message_id
+    ]
+    assert routed, "目标班级群成员应看到真正投递到 GROUP_CLASS 的转发记录"
+    assert all(record.group_id == "GROUP_CLASS" for record in routed)
+
+
+def _test_llm_action_drives_execution():
+    """LLM 的 action_type/source/target/destination 字段须直接形成真实行动。"""
+    import json
+    from types_def import ActionRecord, ActionType, MessageType
+
+    model, origin, bridge, _ = _routing_fixture()
+    original = ActionRecord(
+        agent_id=origin.unique_id,
+        action_type=ActionType.SEND_MESSAGE,
+        content="供 LLM 选择的宿舍群消息",
+        topic_id="T001",
+        message_type=MessageType.ORIGINAL,
+        heat=0.2,
+        tick=0,
+        group_id="GROUP_DORM",
+    )
+    assert model.submit_action(original)
+
+    class StubLLM:
+        def chat(self, prompt: str) -> str:
+            assert original.message_id in prompt
+            return json.dumps({
+                "action_type": "FORWARD",
+                "message_type": "forward",
+                "content": "LLM 决定转发到校园群",
+                "topic_id": "T001",
+                "target_id": origin.unique_id,
+                "source_message_id": original.message_id,
+                "source_group_id": "GROUP_DORM",
+                "destination_group_id": "GROUP_CAMPUS",
+                "opinion_updates": {},
+                "emotion_delta": {"valence": 0.0, "arousal": 0.0},
+            }, ensure_ascii=False)
+
+    model._llm_client = StubLLM()
+    model.llm_action_enabled = True
+    before = model.cross_group_forward
+    bridge.step()
+    record = bridge.pending_action
+    assert record is not None, "LLM 合法行动不应被规则链覆盖"
+    assert record.action_type == ActionType.FORWARD
+    assert record.target_id == origin.unique_id
+    assert record.source_message_id == original.message_id
+    assert record.source_group_id == "GROUP_DORM"
+    assert record.group_id == "GROUP_CAMPUS"
+    assert record.message_type == MessageType.FORWARD
+    assert model.cross_group_forward == before + 1
 
 
 def _test_model_update_environment():
@@ -540,7 +616,7 @@ def _test_model_single_node():
 
 
 def _test_model_place_agents_group_type():
-    """_place_agents 须给每个 agent 分配 group_type（v2 要求）。"""
+    """_place_agents 须建立主群兼容字段与分层多群成员关系。"""
     from types_def import SimConfig, GroupType
     from opinion_model import OpinionModel
     model = OpinionModel(SimConfig(n_agents=10, network_params={"m": 1}))
@@ -549,6 +625,15 @@ def _test_model_place_agents_group_type():
             f"Agent-{agent.unique_id} 缺少 group_type"
         assert isinstance(agent.beliefs.identity.group_type, GroupType), \
             f"Agent-{agent.unique_id} group_type 类型错误"
+        identity = agent.beliefs.identity
+        assert identity.primary_group_id in identity.group_ids
+        expected = {
+            f"GROUP_{group_type.name}"
+            for group_type in GroupType
+            if int(group_type) >= int(identity.group_type)
+        }
+        assert set(identity.group_ids) == expected, \
+            f"Agent-{agent.unique_id} 分层成员关系错误: {identity.group_ids}"
 
 
 # ═══════════════════════════════════════════════════════════════════ #
@@ -578,13 +663,14 @@ if __name__ == "__main__":
 
     print("\n── [A]  OpinionModel 核心流程（v2）")
     _check("DataCollector 含§5全部指标列",     _test_model_datacollector_format)
-    _check("submit_action 写缓存+热度+真实跨群转发", _test_model_submit_action_v2)
-    _check("异群可见消息可形成带 target_id 的 FORWARD", _test_cross_group_visibility_and_forward_target)
+    _check("submit_action 按真实消息路由统计跨群转发", _test_model_submit_action_v2)
+    _check("小群原文隔离，规则转发后目标群可见", _test_true_cross_group_delivery_and_rule_forward)
+    _check("LLM action/target/群路由直接驱动执行", _test_llm_action_drives_execution)
     _check("_update_environment 热度衰减≥0",   _test_model_update_environment)
     _check("各群按自身 β 衰减（CAMPUS 最快）", _test_group_specific_heat_decay)
     _check("干预衰减在触发 tick 立即生效", _test_intervention_applies_same_tick)
     _check("宏观扩散与 Agent 转发指标分离", _test_macro_spread_separate_from_forward)
-    _check("_place_agents 给每个 agent 分配 group_type", _test_model_place_agents_group_type)
+    _check("_place_agents 建立分层多群成员关系", _test_model_place_agents_group_type)
     _check("n=1 单节点 5步不崩溃",             _test_model_single_node)
 
     n_pass = sum(1 for r in _results if r[0] == "✅")

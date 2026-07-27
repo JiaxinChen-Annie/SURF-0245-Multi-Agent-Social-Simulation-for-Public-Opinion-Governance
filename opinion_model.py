@@ -22,11 +22,14 @@ opinion_model.py — 模型/环境层（接口表 #12–20）
   - intervention_tick 由本模块统一维护（B 模块写的为参考值，A 为权威）
   - 所有 event_id → topic_id，枚举对齐新版
 
-【转发行为修复】
-  - 同群消息始终可见，异群消息按 cross_group_visibility 概率进入感知流
-  - cross_group_forward 只统计 Agent 实际执行的跨群 FORWARD
+【多群与真实转发修复】
+  - IdentityBelief.group_ids 表示真实多群成员关系；group_type 仅保留主群兼容语义
+  - 默认采用层级成员关系：DORM→CLASS→MAJOR→CAMPUS
+  - ActionRecord.group_id 是真实投递群；FORWARD 用 source_message_id/source_group_id 追踪来源
+  - 消息仅对目标群成员可见，不再用随机 cross_group_visibility 泄漏异群消息
+  - cross_group_forward 只统计 source_group_id != group_id 的真实 Agent FORWARD
   - 宏观热度扩散单独统计为 cross_group_spread，不再污染转发指标
-  - 热度衰减按群选择对应 B Agent，避免用第一个 Agent 的 β 计算所有群
+  - 热度归入消息目标群，衰减按群选择对应 B Agent
 
 【W4 LLM 接入变更】
   - __init__ 新增 ⑤-b：读取 config.llm_config，调用 C 模块 setup_llm_client
@@ -89,8 +92,9 @@ class OpinionModel(Model):
     供所有 SocialAgent 通过 self.model._llm_client 访问。
     """
 
-    DEFAULT_CROSS_GROUP_VISIBILITY = 0.10
     DEFAULT_CROSS_GROUP_SPREAD_PROBABILITY = 0.15
+    DEFAULT_GROUP_MEMBERSHIP_MODE = "hierarchical"
+    DEFAULT_FORWARD_DESTINATION_STRATEGY = "next_larger"
 
     # ================================================================== #
     #  #12  __init__                                                       #
@@ -107,14 +111,30 @@ class OpinionModel(Model):
         super().__init__()
         self.config = config
 
-        # 跨群行为参数。沿用 network_params 承载，避免破坏 SimConfig 接口。
+        # 群成员与跨群行为参数。沿用 network_params 承载，避免破坏 SimConfig 接口。
         network_params = config.network_params or {}
-        self.cross_group_visibility = _as_probability(
+        if "cross_group_visibility" in network_params:
+            _LOG.warning(
+                "cross_group_visibility 已弃用并被忽略；异群信息必须通过真实 FORWARD 投递"
+            )
+        self.group_membership_mode = str(
+            network_params.get("group_membership_mode", self.DEFAULT_GROUP_MEMBERSHIP_MODE)
+        ).strip().lower()
+        if self.group_membership_mode not in {"hierarchical", "single"}:
+            _LOG.warning(
+                "未知 group_membership_mode=%r，回退 hierarchical",
+                self.group_membership_mode,
+            )
+            self.group_membership_mode = self.DEFAULT_GROUP_MEMBERSHIP_MODE
+
+        self.forward_destination_strategy = str(
             network_params.get(
-                "cross_group_visibility",
-                self.DEFAULT_CROSS_GROUP_VISIBILITY,
-            ),
-            self.DEFAULT_CROSS_GROUP_VISIBILITY,
+                "forward_destination_strategy",
+                self.DEFAULT_FORWARD_DESTINATION_STRATEGY,
+            )
+        ).strip().lower()
+        self.allow_downward_forward = bool(
+            network_params.get("allow_downward_forward", False)
         )
         self.cross_group_spread_probability = _as_probability(
             network_params.get(
@@ -138,6 +158,19 @@ class OpinionModel(Model):
         # ④ 环境状态 —— A 模块权威维护
         #    info_stream_cache: 信息流缓存，供下一 tick 邻居 _perceive 读取
         self.info_stream_cache: List[ActionRecord] = []
+
+        #    群注册表。当前场景每种 GroupType 对应一个真实群频道；Agent 可多群成员。
+        self.group_type_by_id: Dict[str, GroupType] = {
+            self._group_id_for_type(group_type): group_type
+            for group_type in GroupType
+        }
+        self.group_members: Dict[str, set] = {
+            group_id: set() for group_id in self.group_type_by_id
+        }
+
+        #    消息索引：FORWARD 必须引用一条真实存在且发送者可见的源消息。
+        self._message_seq: int = 0
+        self._message_by_id: Dict[str, ActionRecord] = {}
 
         #    topic_heat: {topic_id: {group_type: heat}}  各群各话题热度
         self.topic_heat: Dict[str, Dict[GroupType, float]] = {
@@ -197,6 +230,7 @@ class OpinionModel(Model):
         #
         # 若 llm_config 为空 {}，则跳过初始化，_llm_client = None。
         self._llm_client = None
+        self.llm_action_enabled = bool(config.llm_config.get("use_actions", True))
         if config.llm_config:
             try:
                 from llm_utils import setup_llm_client
@@ -246,7 +280,7 @@ class OpinionModel(Model):
             f"OpinionModel 初始化完成 | "
             f"n_agents={config.n_agents} | "
             f"network={config.network_type} | "
-            f"cross_visibility={self.cross_group_visibility:.2f} | "
+            f"membership={self.group_membership_mode} | "
             f"llm={'已接入' if self._llm_client is not None else '规则存根'} | "
             f"mesa={'系统' if _MESA_REAL else '垫片'}"
         )
@@ -309,8 +343,16 @@ class OpinionModel(Model):
     def _place_agents(self) -> None:
         """
         将四类智能体（ORDINARY/ACTIVE/RATIONAL/CONTROLLER）按比例部署到网络节点。
-        同时按 group_type_ratio 为每个 agent 分配群类型（GroupType）。
-        实例化时须同时传入 agent_type 与 group_type（接口表 #14 要求）。
+        ``group_type_ratio`` 决定 Agent 的“主群/最小群”。在默认
+        ``group_membership_mode=hierarchical`` 下，成员关系按校园层级向上包含：
+
+        DORM → DORM+CLASS+MAJOR+CAMPUS
+        CLASS → CLASS+MAJOR+CAMPUS
+        MAJOR → MAJOR+CAMPUS
+        CAMPUS → CAMPUS
+
+        这样同一个人可以把自己在小群中看到的真实消息投递到其加入的大群。
+        ``single`` 模式保留旧的一人一群行为，仅用于兼容对照实验。
         GROUP_BETA 由 SocialAgent 内部读取，A 模块无需传入。
         """
         from social_agent import SocialAgent
@@ -355,9 +397,26 @@ class OpinionModel(Model):
         for agent_type, count in counts.items():
             for _ in range(count):
                 group_type = group_assignments[agent_id]
+
+                if self.group_membership_mode == "hierarchical":
+                    membership_types = [
+                        candidate for candidate in GroupType
+                        if int(candidate) >= int(group_type)
+                    ]
+                else:
+                    membership_types = [group_type]
+
+                group_ids = [
+                    self._group_id_for_type(candidate)
+                    for candidate in membership_types
+                ]
+                primary_group_id = self._group_id_for_type(group_type)
+
                 init_config: Dict[str, Any] = {
                     "agent_type":   agent_type,
                     "group_type":   group_type,
+                    "primary_group_id": primary_group_id,
+                    "group_ids": group_ids,
                     "stance_prior": self.random.uniform(-1.0, 1.0),
                     "topic_id":     "T001",
                     "initial_heat": 0.5,  # H₀ 初始热度
@@ -372,12 +431,19 @@ class OpinionModel(Model):
                 self.schedule.add(agent)
                 self.grid.place_agent(agent, nodes[agent_id])
                 self._agent_dict[agent_id] = agent  # 自维护查找字典
+                for group_id in group_ids:
+                    self.group_members[group_id].add(agent_id)
                 agent_id += 1
 
         dist_str = " | ".join(f"{t.name}:{c}" for t, c in counts.items())
         gdist_str = " | ".join(f"{g.name}:{c}" for g, c in group_counts.items())
         _LOG.info(f"AgentType 分布: {dist_str}")
-        _LOG.info(f"GroupType 分布: {gdist_str}")
+        _LOG.info(f"主群 GroupType 分布: {gdist_str}")
+        membership_str = " | ".join(
+            f"{group_id}:{len(members)}"
+            for group_id, members in self.group_members.items()
+        )
+        _LOG.info(f"真实群成员数: {membership_str}")
 
     # ================================================================== #
     #  #15  step                                                           #
@@ -558,6 +624,11 @@ class OpinionModel(Model):
             r for r in self.info_stream_cache
             if current_tick - r.tick <= EXPIRE_TICKS
         ]
+        self._message_by_id = {
+            record.message_id: record
+            for record in self.info_stream_cache
+            if record.message_id
+        }
 
     # ================================================================== #
     #  #17  _calc_avg_opinion                                              #
@@ -620,117 +691,184 @@ class OpinionModel(Model):
     def _register_agent(self, agent) -> None:
         """将 agent 注册到 A 模块自维护的查找字典（Mesa 3.x 兼容）。"""
         self._agent_dict[agent.unique_id] = agent
+        if hasattr(agent, "beliefs"):
+            identity = agent.beliefs.identity
+            group_ids = list(getattr(identity, "group_ids", []) or [])
+            if not group_ids:
+                group_ids = [self._group_id_for_type(identity.group_type)]
+            for group_id in group_ids:
+                if group_id in self.group_members:
+                    self.group_members[group_id].add(agent.unique_id)
 
-    def submit_action(self, record: ActionRecord) -> None:
+    def submit_action(self, record: ActionRecord) -> bool:
         """
-        将智能体行动写入环境信息流缓存，供下一 tick 邻居 _perceive 读取。
-        同时更新 topic_heat / topic_negative / cross_group_forward 统计。
+        校验并投递一条行动记录。
 
-        W4 新增：
-          - 处理 record.heat / record.negative_score / record.message_type
-          - 若 source 与 target 属不同群，cross_group_forward 计数 +1
-            （此处基于 action_type=FORWARD 且有 target_id 时判断；
-             FORWARD 的 target_id 表示被转发消息的原作者）
+        路由语义：
+          - ``record.group_id`` 是消息真正进入的信息流群；
+          - FORWARD 必须引用 ``source_message_id``（兼容旧调用时可由 target_id
+            在发送者可见消息中回溯）；
+          - ``source_group_id`` 从真实源消息推导，不能由作者主群猜测；
+          - 仅当 ``source_group_id != group_id`` 时计入 ``cross_group_forward``。
 
-        Parameters
-        ----------
-        record : ActionRecord
+        无效路由不会进入信息流，返回 ``False``；成功投递返回 ``True``。
         """
-        # ① 写入缓存
+        sender = self._get_agent_by_id(record.agent_id)
+        if sender is None or not hasattr(sender, "beliefs"):
+            _LOG.warning("拒绝未知发送者的行动: agent_id=%s", record.agent_id)
+            return False
+
+        member_group_ids = set(self.get_agent_groups(record.agent_id))
+        destination_group_id = (record.group_id or self.get_agent_group(record.agent_id) or "").strip()
+        if destination_group_id not in self.group_type_by_id:
+            _LOG.warning(
+                "拒绝行动：目标群不存在 | agent=%s group_id=%r",
+                record.agent_id,
+                destination_group_id,
+            )
+            return False
+        if destination_group_id not in member_group_ids:
+            _LOG.warning(
+                "拒绝行动：发送者不是目标群成员 | agent=%s group_id=%s memberships=%s",
+                record.agent_id,
+                destination_group_id,
+                sorted(member_group_ids),
+            )
+            return False
+
+        source_record: Optional[ActionRecord] = None
+        if record.action_type == ActionType.FORWARD:
+            source_record = self._resolve_forward_source(record, member_group_ids)
+            if source_record is None:
+                _LOG.warning(
+                    "拒绝 FORWARD：找不到发送者可见的真实源消息 | "
+                    "agent=%s source_message_id=%r target_id=%r",
+                    record.agent_id,
+                    record.source_message_id,
+                    record.target_id,
+                )
+                return False
+
+            record.source_message_id = source_record.message_id
+            record.source_group_id = source_record.group_id
+            record.target_id = source_record.agent_id
+            if not record.topic_id:
+                record.topic_id = source_record.topic_id
+        else:
+            # 原创/回复消息本身就在目标群中。REPLY 可保留 source_message_id 供追踪，
+            # 但不会被当作跨群转发统计。
+            record.source_group_id = destination_group_id
+            if record.action_type == ActionType.SEND_MESSAGE:
+                record.source_message_id = None
+
+        record.group_id = destination_group_id
+        if not record.message_id:
+            record.message_id = self._allocate_message_id()
+        elif record.message_id in self._message_by_id:
+            _LOG.warning("拒绝重复 message_id=%s", record.message_id)
+            return False
+
         self.info_stream_cache.append(record)
+        self._message_by_id[record.message_id] = record
 
-        topic_id = record.topic_id
-
-        # ② 确保 topic 存在于热度字典
+        topic_id = record.topic_id or "T001"
+        record.topic_id = topic_id
         if topic_id not in self.topic_heat:
-            self.topic_heat[topic_id]     = {g: 0.0 for g in GroupType}
+            self.topic_heat[topic_id] = {g: 0.0 for g in GroupType}
             self.topic_negative[topic_id] = {g: 0.0 for g in GroupType}
-            self._topic_heat_flat[topic_id]    = 0.0
+            self._topic_heat_flat[topic_id] = 0.0
             self._topic_negative_flat[topic_id] = 0.0
 
-        # ③ 找到发送方所在群
-        src_agent = self._get_agent_by_id(record.agent_id)
-        src_group = (src_agent.beliefs.identity.group_type
-                     if src_agent and hasattr(src_agent, "beliefs")
-                     else GroupType.CLASS)
-
-        # ④ 更新该群 topic_heat（叠加 record.heat）
-        heat_delta = record.heat if record.heat > 0 else 0.1  # 最小贡献
-        self.topic_heat[topic_id][src_group] = min(
-            self.topic_heat[topic_id][src_group] + heat_delta,
-            10.0,   # 热度上限，防止无界增长
+        # 热度/负面值归入消息实际投递群，而不是发送者的主群。
+        destination_group_type = self.group_type_by_id[destination_group_id]
+        heat_delta = record.heat if record.heat > 0 else 0.1
+        self.topic_heat[topic_id][destination_group_type] = min(
+            self.topic_heat[topic_id][destination_group_type] + heat_delta,
+            10.0,
         )
 
-        # ⑤ 更新该群 topic_negative（指数平滑）
-        SMOOTH = 0.2
-        old_neg = self.topic_negative[topic_id][src_group]
-        self.topic_negative[topic_id][src_group] = float(
-            (1 - SMOOTH) * old_neg + SMOOTH * record.negative_score
+        smooth = 0.2
+        old_neg = self.topic_negative[topic_id][destination_group_type]
+        self.topic_negative[topic_id][destination_group_type] = float(
+            (1 - smooth) * old_neg + smooth * record.negative_score
         )
 
-        # ⑥ 跨群转发判断：FORWARD 行动 + 有来源作者 → 检查两者所在群
-        # 使用 action_type，而非 message_type：RATIONAL/ORDINARY 的转发可能
-        # 以 PARAPHRASE 表达，但仍是一次真实的 FORWARD 行为。
-        if (record.action_type == ActionType.FORWARD
-                and record.target_id is not None):
-            tgt_agent = self._get_agent_by_id(record.target_id)
-            if tgt_agent and hasattr(tgt_agent, "beliefs"):
-                tgt_group = tgt_agent.beliefs.identity.group_type
-                if tgt_group != src_group:
-                    self.cross_group_forward += 1
+        if (
+            record.action_type == ActionType.FORWARD
+            and source_record is not None
+            and source_record.group_id != destination_group_id
+        ):
+            self.cross_group_forward += 1
 
-        # ⑦ 刷新扁平视图
         vals = list(self.topic_heat[topic_id].values())
         self._topic_heat_flat[topic_id] = float(np.mean(vals))
         neg_vals = list(self.topic_negative[topic_id].values())
         self._topic_negative_flat[topic_id] = float(np.mean(neg_vals))
+        return True
 
     # ================================================================== #
     #  B 模块接口适配（供 social_agent._perceive 调用）                    #
     # ================================================================== #
 
     def get_agent_group(self, agent_id: int) -> Optional[str]:
-        """返回 agent 所在群 ID（格式：'GROUP_{GroupType.name}'）。"""
+        """返回 Agent 的主群 ID（兼容旧接口）。"""
         agent = self._get_agent_by_id(agent_id)
         if agent and hasattr(agent, "beliefs"):
-            gt = agent.beliefs.identity.group_type
-            return f"GROUP_{gt.name}"
+            identity = agent.beliefs.identity
+            primary = getattr(identity, "primary_group_id", "")
+            if primary:
+                return primary
+            return self._group_id_for_type(identity.group_type)
         return None
 
+    def get_agent_groups(self, agent_id: int) -> List[str]:
+        """返回 Agent 的全部真实群成员关系。"""
+        agent = self._get_agent_by_id(agent_id)
+        if not agent or not hasattr(agent, "beliefs"):
+            return []
+        identity = agent.beliefs.identity
+        group_ids = list(getattr(identity, "group_ids", []) or [])
+        if not group_ids:
+            group_ids = [self._group_id_for_type(identity.group_type)]
+        return [group_id for group_id in group_ids if group_id in self.group_type_by_id]
+
     def get_group_type(self, agent_id: int) -> GroupType:
-        """返回 agent 的群类型。"""
+        """返回 Agent 主群类型（兼容旧接口）。"""
         agent = self._get_agent_by_id(agent_id)
         if agent and hasattr(agent, "beliefs"):
             return agent.beliefs.identity.group_type
         return GroupType.CLASS
 
-    def get_group_messages(self, agent_id: int, limit: int = 20) -> List[ActionRecord]:
+    def get_group_type_by_id(self, group_id: str) -> Optional[GroupType]:
+        """由真实群 ID 返回 GroupType。"""
+        return self.group_type_by_id.get(group_id)
+
+    def get_group_messages(
+        self,
+        agent_id: int,
+        limit: int = 20,
+        group_id: Optional[str] = None,
+    ) -> List[ActionRecord]:
         """
         返回 Agent 可见的最近消息。
 
-        - 同群消息始终可见；
-        - 异群消息以 ``cross_group_visibility`` 概率可见，模拟从其他群
-          截图、转述或转发进入当前群的信息；
-        - 返回顺序仍为从新到旧，最多 ``limit`` 条。
+        可见性只由真实群成员关系决定：消息仅对 ``record.group_id`` 的成员可见。
+        跨群消息必须由一次 FORWARD 在目标群中创建新记录，不再使用随机“异群泄漏”。
         """
         if limit <= 0:
             return []
 
-        src_group = self.get_group_type(agent_id)
+        member_group_ids = set(self.get_agent_groups(agent_id))
+        if group_id is not None:
+            if group_id not in member_group_ids:
+                return []
+            visible_group_ids = {group_id}
+        else:
+            visible_group_ids = member_group_ids
+
         result: List[ActionRecord] = []
         for record in reversed(self.info_stream_cache):
-            rec_agent = self._get_agent_by_id(record.agent_id)
-            if not rec_agent or not hasattr(rec_agent, "beliefs"):
-                continue
-
-            rec_group = rec_agent.beliefs.identity.group_type
-            visible = rec_group == src_group
-            if (not visible
-                    and self.cross_group_visibility > 0.0
-                    and self.random.random() < self.cross_group_visibility):
-                visible = True
-
-            if visible:
+            if record.group_id in visible_group_ids:
                 result.append(record)
                 if len(result) >= limit:
                     break
@@ -743,6 +881,28 @@ class OpinionModel(Model):
     def get_topic_negative(self) -> Dict[str, float]:
         """返回各话题平均负面程度（扁平视图）。"""
         return dict(self._topic_negative_flat)
+
+    def get_topic_heat_by_group(self, agent_id: int) -> Dict[str, Dict[str, float]]:
+        """返回该 Agent 所在各群的逐话题热度。"""
+        result: Dict[str, Dict[str, float]] = {}
+        for group_id in self.get_agent_groups(agent_id):
+            group_type = self.group_type_by_id[group_id]
+            result[group_id] = {
+                topic_id: float(group_map.get(group_type, 0.0))
+                for topic_id, group_map in self.topic_heat.items()
+            }
+        return result
+
+    def get_topic_negative_by_group(self, agent_id: int) -> Dict[str, Dict[str, float]]:
+        """返回该 Agent 所在各群的逐话题负面值。"""
+        result: Dict[str, Dict[str, float]] = {}
+        for group_id in self.get_agent_groups(agent_id):
+            group_type = self.group_type_by_id[group_id]
+            result[group_id] = {
+                topic_id: float(group_map.get(group_type, 0.0))
+                for topic_id, group_map in self.topic_negative.items()
+            }
+        return result
 
     # ================================================================== #
     #  额外 DataCollector 指标                                             #
@@ -809,6 +969,80 @@ class OpinionModel(Model):
     #  内部辅助                                                            #
     # ================================================================== #
 
+    @staticmethod
+    def _group_id_for_type(group_type: GroupType) -> str:
+        return f"GROUP_{group_type.name}"
+
+    def _allocate_message_id(self) -> str:
+        self._message_seq += 1
+        return f"M{self._message_seq:08d}"
+
+    def _resolve_forward_source(
+        self,
+        record: ActionRecord,
+        member_group_ids: set,
+    ) -> Optional[ActionRecord]:
+        """解析 FORWARD 的真实源消息，并验证发送者当下可见。"""
+        source: Optional[ActionRecord] = None
+        if record.source_message_id:
+            source = self._message_by_id.get(record.source_message_id)
+
+        # 兼容旧代码：target_id 过去被当作“原作者”。只允许从发送者真实可见
+        # 的当前缓存中回溯，绝不再用作者主群直接猜来源群。
+        if source is None and record.target_id is not None:
+            source = next(
+                (
+                    candidate
+                    for candidate in reversed(self.info_stream_cache)
+                    if candidate.agent_id == record.target_id
+                    and candidate.group_id in member_group_ids
+                ),
+                None,
+            )
+
+        if source is None or source.group_id not in member_group_ids:
+            return None
+        return source
+
+    def get_forward_destination_candidates(
+        self,
+        agent_id: int,
+        source_group_id: str,
+    ) -> List[str]:
+        """返回该成员可把源消息转发到的其他真实群，按层级从小到大排序。"""
+        source_type = self.group_type_by_id.get(source_group_id)
+        if source_type is None:
+            return []
+
+        candidates = [
+            group_id
+            for group_id in self.get_agent_groups(agent_id)
+            if group_id != source_group_id
+        ]
+        if not self.allow_downward_forward:
+            candidates = [
+                group_id
+                for group_id in candidates
+                if int(self.group_type_by_id[group_id]) > int(source_type)
+            ]
+        return sorted(candidates, key=lambda gid: int(self.group_type_by_id[gid]))
+
+    def select_forward_destination(
+        self,
+        agent_id: int,
+        source_group_id: str,
+    ) -> Optional[str]:
+        """按配置策略选择一次真实跨群转发的投递群。"""
+        candidates = self.get_forward_destination_candidates(agent_id, source_group_id)
+        if not candidates:
+            return None
+        if self.forward_destination_strategy == "largest":
+            return candidates[-1]
+        if self.forward_destination_strategy == "random":
+            return self.random.choice(candidates)
+        # 默认 next_larger：模拟宿舍群→班级群→专业群→校园群的逐层扩散。
+        return candidates[0]
+
     def _collect_opinion_values(self) -> List[float]:
         """从所有 Agent 提取对 T001 话题的观点值列表。"""
         vals: List[float] = []
@@ -842,7 +1076,10 @@ class OpinionModel(Model):
         for agent in list(self.schedule.agents):
             if (hasattr(agent, "beliefs")
                     and agent.beliefs.identity.agent_type == AgentType.CONTROLLER):
-                groups.add(agent.beliefs.identity.group_type)
+                for group_id in self.get_agent_groups(agent.unique_id):
+                    group_type = self.group_type_by_id.get(group_id)
+                    if group_type is not None:
+                        groups.add(group_type)
         return groups
 
     @staticmethod

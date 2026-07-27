@@ -15,10 +15,11 @@ types_def.py — 全项目共享数据类型
               neighbor_actions → recent_messages 重命名
   - ActionRecord 新增 distortion_level/message_type/negative_score/heat
   - 全项目 event_id → topic_id
-  - IdentityBelief 新增 group_type/nickname
+  - IdentityBelief 新增 group_type/nickname；后续补充 primary_group_id/group_ids 支持多群成员
   - OpinionBelief: event_id → topic_id
   - Desire: event_id→topic_id，新增 target_id
   - Intention: event_id→topic_id
+  - ActionRecord/SocialInfo/Desire/Intention 补充消息 ID 与 source_group→destination_group 路由字段
   - SimConfig.agent_type_ratio 键对应新 AgentType 名称
 
 数值约定：
@@ -142,11 +143,17 @@ class EmotionState:
 @dataclass
 class IdentityBelief:
     """
-    身份信念（v2 新增 group_type / nickname）。
+    身份信念。
+
+    ``group_type`` / ``primary_group_id`` 保留“主群”语义以兼容旧调用；
+    ``group_ids`` 才是 Agent 的真实群成员关系。一个 Agent 可以同时属于
+    DORM / CLASS / MAJOR / CAMPUS 多个层级群。
     """
     agent_type:   AgentType  = AgentType.ORDINARY
-    group_type:   GroupType  = GroupType.CLASS    # v2 新增
-    nickname:     str        = ""                 # v2 新增：群内昵称
+    group_type:   GroupType  = GroupType.CLASS    # 兼容字段：主群类型
+    primary_group_id: str    = "GROUP_CLASS"
+    group_ids:    List[str]  = field(default_factory=lambda: ["GROUP_CLASS"])
+    nickname:     str        = ""                 # 群内昵称
     role_desc:    str        = ""
     stance_prior: float      = 0.0               # [-1, 1]
 
@@ -198,6 +205,10 @@ class SocialInfo:
     original_content: str        = ""                   # v2 新增：原始消息内容
     negative_score:   float      = 0.0                  # v2 新增，[0,1]
     heat:             float      = 0.0                  # v2 新增，[0,+∞)
+    message_id:       str        = ""                   # 环境分配的唯一消息 ID
+    group_id:         str        = ""                   # 当前消息实际所在/投递到的群
+    source_message_id: Optional[str] = None              # FORWARD 的源消息 ID
+    source_group_id:  str        = ""                   # FORWARD 从哪个群取出；原创=group_id
 
 
 @dataclass
@@ -206,14 +217,17 @@ class Perception:
     智能体单步感知结果（v2 全面更新）。
     neighbor_actions → recent_messages 重命名；新增 group_id/group_type/beta/topic_heat/topic_negative。
     """
-    group_id:        str                       = ""                   # v2 新增
-    group_type:      GroupType                 = GroupType.CLASS      # v2 新增
-    beta:            float                     = 0.12                 # v2 新增：GROUP_BETA[group_type]
+    group_id:        str                       = ""                   # 兼容字段：主群 ID
+    group_ids:       List[str]                 = field(default_factory=list)  # 真实成员群
+    group_type:      GroupType                 = GroupType.CLASS      # 兼容字段：主群类型
+    beta:            float                     = 0.12                 # 主群 GROUP_BETA
     recent_messages: List[SocialInfo]          = field(default_factory=list)  # 原 neighbor_actions
     mentions:        List[SocialInfo]          = field(default_factory=list)
     tick:            int                       = 0
     topic_heat:      Dict[str, float]          = field(default_factory=dict)  # v2 新增
     topic_negative:  Dict[str, float]          = field(default_factory=dict)  # v2 新增
+    topic_heat_by_group: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    topic_negative_by_group: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -239,6 +253,10 @@ class ActionRecord:
     message_type:     str             = MessageType.ORIGINAL  # v2 新增
     negative_score:   float           = 0.0              # v2 新增，[0,1]
     heat:             float           = 0.0              # v2 新增：本次消息热度贡献
+    message_id:       str             = ""               # 环境写入时分配
+    group_id:         str             = ""               # 消息真正投递到的目标群
+    source_message_id: Optional[str]  = None              # FORWARD 的源消息
+    source_group_id:  str             = ""               # FORWARD 来源群；原创=group_id
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -255,6 +273,9 @@ class Desire:
     priority:  float         = 0.5          # [0, 1]
     topic_id:  str           = "T001"       # 原 event_id
     target_id: Optional[int] = None         # v2 新增：reply 欲望时指向目标 agent
+    source_message_id: Optional[str] = None
+    source_group_id: str = ""
+    destination_group_id: str = ""
 
 
 @dataclass
@@ -266,6 +287,10 @@ class Intention:
     content_plan: str             = ""
     topic_id:     str             = "T001"   # 原 event_id
     target_id:    Optional[int]   = None
+    source_message_id: Optional[str] = None
+    source_group_id: str = ""
+    destination_group_id: str = ""
+    message_type: str = ""              # LLM 可显式指定；空串表示由规则推导
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -59,10 +59,19 @@ class DummyAgent(Agent):
         self.opinion = random.uniform(-1, 1)
         self.valence = random.uniform(-1, 1)
 
+        primary_group_id = f"GROUP_{group_type.name}"
+        group_ids = [
+            f"GROUP_{candidate.name}"
+            for candidate in GroupType
+            if int(candidate) >= int(group_type)
+        ]
+
         self.beliefs = BeliefSystem(
             identity=IdentityBelief(
                 agent_type=agent_type,
                 group_type=group_type,
+                primary_group_id=primary_group_id,
+                group_ids=group_ids,
                 nickname=f"{agent_type.name[:3]}-{unique_id}",
                 role_desc=f"{agent_type.name}-{group_type.name}",
                 stance_prior=self.opinion,
@@ -127,12 +136,25 @@ class DummyAgent(Agent):
 
         roll = rng.random()
         source = None
-        if visible and roll < forward_prob:
+        destination_group_id = self.beliefs.identity.primary_group_id
+        forwardable = [
+            record for record in visible
+            if self.model.get_forward_destination_candidates(
+                self.unique_id,
+                record.group_id,
+            )
+        ]
+        if forwardable and roll < forward_prob:
             action_type = ActionType.FORWARD
-            source = rng.choice(visible)
+            source = rng.choice(forwardable)
+            destination_group_id = self.model.select_forward_destination(
+                self.unique_id,
+                source.group_id,
+            )
         elif visible and roll < forward_prob + 0.18:
             action_type = ActionType.REPLY
             source = rng.choice(visible)
+            destination_group_id = source.group_id
         elif roll < forward_prob + 0.58:
             action_type = ActionType.SEND_MESSAGE
         else:
@@ -174,9 +196,15 @@ class DummyAgent(Agent):
             heat=rng.uniform(0.05, 0.35),
             tick=int(self.model.schedule.time),
             target_id=source.agent_id if source is not None else None,
+            group_id=destination_group_id,
+            source_message_id=(
+                source.message_id
+                if source is not None and action_type == ActionType.FORWARD
+                else None
+            ),
+            source_group_id=source.group_id if source is not None else destination_group_id,
         )
-        self.pending_action = record
-        self.model.submit_action(record)
+        self.pending_action = record if self.model.submit_action(record) else None
 
 
 # ============================================================
@@ -253,6 +281,8 @@ class TestOpinionModel(OpinionModel):
         # OpinionModel 自维护的 O(1) 查找表也必须同步清空，否则会继续指向
         # 父类初始化时创建的旧 SocialAgent。
         self._agent_dict.clear()
+        for members in self.group_members.values():
+            members.clear()
         # 清空 grid 节点上的 agent 列表
         try:
             for node in self.grid.G.nodes():
@@ -518,7 +548,7 @@ if __name__ == "__main__":
         print("  - AgentType/GroupType/ActionType/MessageType 枚举对齐 v2 ✅")
         print("  - submit_action 更新 topic_heat/topic_negative/cross_group_forward ✅")
         print("  - _update_environment 热度按 H_k 公式衰减 ✅")
-        print("  - Agent 基于实际可见消息自然转发，未强制选择异群目标 ✅")
+        print("  - Agent 基于真实源消息与多群成员关系执行跨群投递 ✅")
         print("  - FORWARD 与 forward/paraphrase 消息类型语义一致 ✅")
         print("  - 渐进升温在中间 tick 触发干预 ✅")
         print("  - 未恢复使用 -1，最终恢复结果进入 final_summary ✅")

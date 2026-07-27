@@ -22,10 +22,12 @@ social_agent.py — 智能体层（接口表 #1–11）
 
 【转发行为修复】
   - 所有角色按差异化概率生成 share，不再只允许 ACTIVE 转发
-  - share 必须绑定一条真实可见消息，target_id 记录原消息作者
-  - 转发内容保留来源标识，供 A 模块识别实际跨群 FORWARD
+  - share 必须绑定真实 source_message_id/source_group_id 与 destination_group_id
+  - target_id 仅保留源消息作者语义，不再承担群路由
+  - LLM 返回的 action_type/target/消息与群路由直接转换为 Intention 并优先执行
+  - 转发在目标群创建新 ActionRecord，供目标群成员下一 tick 感知
 
-B 同学 S2 阶段用真实 LLM 版本替换 _update_beliefs 即可。
+真实 LLM 与规则降级共用同一套 Intention/ActionRecord 路由校验。
 """
 
 from __future__ import annotations
@@ -144,14 +146,25 @@ class SocialAgent(Agent):
         topic_id    = init_config.get("topic_id", "T001")
         stance_prior = float(init_config.get("stance_prior", 0.0))
         nickname    = init_config.get("nickname", f"{agent_type.name[:3]}-{unique_id}")
+        primary_group_id = str(
+            init_config.get("primary_group_id", f"GROUP_{group_type.name}")
+        )
+        group_ids = list(init_config.get("group_ids", [primary_group_id]))
+        if primary_group_id not in group_ids:
+            group_ids.insert(0, primary_group_id)
 
         # 初始化信念系统
         self.beliefs = BeliefSystem(
             identity=IdentityBelief(
                 agent_type=agent_type,
-                group_type=group_type,          # v2 新增
-                nickname=nickname,              # v2 新增
-                role_desc=f"{agent_type.name}-{group_type.name}-{unique_id}",
+                group_type=group_type,          # 兼容字段：主群类型
+                primary_group_id=primary_group_id,
+                group_ids=group_ids,
+                nickname=nickname,
+                role_desc=(
+                    f"{agent_type.name}-{group_type.name}-{unique_id}"
+                    f" memberships={','.join(group_ids)}"
+                ),
                 stance_prior=stance_prior,
             ),
             opinions={
@@ -166,6 +179,7 @@ class SocialAgent(Agent):
         self.memory: deque = deque(maxlen=_MEMORY_CAPACITY)
         self.pending_action: Optional[ActionRecord] = None
         self._last_perception: Optional[Perception] = None
+        self._llm_intention: Optional[Intention] = None
 
         self._init_psychology()
 
@@ -198,6 +212,7 @@ class SocialAgent(Agent):
     def step(self) -> None:
         """串联完整 BDI 链；子步异常须降级，不崩溃。"""
         self.pending_action = None
+        self._llm_intention = None
         try:
             perception = self._perceive()
         except Exception as e:
@@ -215,8 +230,15 @@ class SocialAgent(Agent):
             _LOG.debug(f"Agent-{self.unique_id} _update_beliefs 异常: {e}")
 
         try:
-            desires   = self._infer_desires()
-            intention = self._plan_intentions(desires)
+            if (
+                self._llm_intention is not None
+                and bool(getattr(self.model, "llm_action_enabled", True))
+            ):
+                # LLM 的 action_type / target / 路由字段直接驱动本轮执行。
+                intention = self._llm_intention
+            else:
+                desires = self._infer_desires()
+                intention = self._plan_intentions(desires)
             env_fb    = self._execute_action(intention)
             self._update_emotion(env_fb)
         except Exception as e:
@@ -233,6 +255,7 @@ class SocialAgent(Agent):
         tick       = int(self.model.schedule.time)
         group_type = self.beliefs.identity.group_type
         group_id   = self.model.get_agent_group(self.unique_id) or f"GROUP_{group_type.name}"
+        group_ids  = self.model.get_agent_groups(self.unique_id) or [group_id]
         beta       = self.beta
 
         # 从 A 模块获取同群近期消息（最多 20 条）
@@ -258,6 +281,10 @@ class SocialAgent(Agent):
                 original_content=record.content,
                 negative_score=record.negative_score,
                 heat=record.heat,
+                message_id=record.message_id,
+                group_id=record.group_id,
+                source_message_id=record.source_message_id,
+                source_group_id=record.source_group_id,
             )
             recent_messages.append(si)
             if si.is_mention:
@@ -265,9 +292,12 @@ class SocialAgent(Agent):
 
         topic_heat     = self.model.get_topic_heat()
         topic_negative = self.model.get_topic_negative()
+        topic_heat_by_group = self.model.get_topic_heat_by_group(self.unique_id)
+        topic_negative_by_group = self.model.get_topic_negative_by_group(self.unique_id)
 
         perception = Perception(
             group_id=group_id,
+            group_ids=group_ids,
             group_type=group_type,
             beta=beta,
             recent_messages=recent_messages,
@@ -275,6 +305,8 @@ class SocialAgent(Agent):
             tick=tick,
             topic_heat=topic_heat,
             topic_negative=topic_negative,
+            topic_heat_by_group=topic_heat_by_group,
+            topic_negative_by_group=topic_negative_by_group,
         )
         self._last_perception = perception
         return perception
@@ -319,18 +351,48 @@ class SocialAgent(Agent):
                 # ── 构造 env_info（对齐 C 模块 build_prompt 期望的字段）──
                 env_info = {
                     "group_type": self.beliefs.identity.group_type.name,
+                    "primary_group_id": self.beliefs.identity.primary_group_id,
+                    "group_ids": list(self.beliefs.identity.group_ids),
                     "beta":       self.beta,
+                    "group_beta": {
+                        group_id: GROUP_BETA[self.model.get_group_type_by_id(group_id)]
+                        for group_id in self.beliefs.identity.group_ids
+                        if self.model.get_group_type_by_id(group_id) is not None
+                    },
                     "role":       self.beliefs.identity.agent_type.name,
                     "nickname":   self.beliefs.identity.nickname,
-                    # recent_messages 转为字符串列表（C 模块 prompt 模板格式）
+                    # 给 LLM 稳定的消息 ID 与群路由字段，禁止凭空造来源。
                     "recent_messages": [
-                        f"[{si.message_type.name if hasattr(si.message_type, 'name') else si.message_type}]"
-                        f" {si.source_nickname or si.source_id}: {si.content}"
+                        {
+                            "message_id": si.message_id,
+                            "group_id": si.group_id,
+                            "source_id": si.source_id,
+                            "source_nickname": si.source_nickname,
+                            "message_type": (
+                                si.message_type.name
+                                if hasattr(si.message_type, "name")
+                                else si.message_type
+                            ),
+                            "content": si.content,
+                            "topic_id": si.topic_id,
+                            "distortion_level": si.distortion_level,
+                            "negative_score": si.negative_score,
+                        }
                         for si in perception.recent_messages[:5]
                     ],
-                    "mentions": [si.content for si in perception.mentions[:3]],
+                    "mentions": [
+                        {
+                            "message_id": si.message_id,
+                            "group_id": si.group_id,
+                            "source_id": si.source_id,
+                            "content": si.content,
+                        }
+                        for si in perception.mentions[:3]
+                    ],
                     "topic_heat":     perception.topic_heat,
                     "topic_negative": perception.topic_negative,
+                    "topic_heat_by_group": perception.topic_heat_by_group,
+                    "topic_negative_by_group": perception.topic_negative_by_group,
                 }
 
                 # ── 调用 C 模块三个接口 ────────────────────────────────
@@ -358,6 +420,13 @@ class SocialAgent(Agent):
                     0.0, 1.0,
                 ))
 
+                # LLM 的行动字段不再丢弃：转换成可执行 Intention，step() 会优先执行。
+                if bool(getattr(self.model, "llm_action_enabled", True)):
+                    self._llm_intention = self._intention_from_llm_result(
+                        result,
+                        perception,
+                    )
+
                 # ── 写入记忆（与规则路径逻辑一致）───────────────────────
                 for si in perception.recent_messages[:3]:
                     self.memory.append(MemoryRecord(
@@ -371,7 +440,7 @@ class SocialAgent(Agent):
                     f"action={result.get('action_type_name', '?')} | "
                     f"opinion_updates={result.get('opinion_updates', {})}"
                 )
-                return   # LLM 路径完成，跳过规则存根
+                return   # LLM 信念与行动意图均已处理，跳过规则存根
 
             except Exception as e:
                 # LLM 调用失败：打日志后自动降级，不向上抛出
@@ -432,115 +501,169 @@ class SocialAgent(Agent):
     # ------------------------------------------------------------------ #
     def _infer_desires(self) -> List[Desire]:
         """
-        基于信念生成欲望列表（v2：goal_type = reply/discuss/share/clarify/intervene/silent）。
-        CONTROLLER 且 group_type ≠ DORM 时可生成 intervene 欲望。
-        DORM 群 Controller 不生成 intervene（t_dorm^int = +∞）。
-        热度 H(t) ≥ θ 时 Controller 触发干预欲望。
+        基于信念与多群感知生成欲望。
+
+        share/reply/clarify 都绑定真实消息与真实群；share 还必须给出另一个
+        Agent 已加入的 ``destination_group_id``，因此不会再生成 target=None
+        或“只改计数、不投递消息”的伪跨群转发。
         """
-        e          = self.beliefs.emotion
+        emotion = self.beliefs.emotion
         agent_type = self.beliefs.identity.agent_type
-        group_type = self.beliefs.identity.group_type
-        topic_id   = self._get_primary_topic_id()
+        topic_id = self._get_primary_topic_id()
+        primary_group_id = self._get_primary_group_id()
         desires: List[Desire] = []
 
-        # 当前话题热度（从感知缓存读取）
-        current_heat = 0.0
-        if self._last_perception:
-            current_heat = self._last_perception.topic_heat.get(topic_id, 0.0)
+        hottest_group_id = primary_group_id
+        hottest_heat = 0.0
+        if self._last_perception is not None:
+            for group_id, topic_map in self._last_perception.topic_heat_by_group.items():
+                heat = float(topic_map.get(topic_id, 0.0))
+                if heat > hottest_heat:
+                    hottest_heat = heat
+                    hottest_group_id = group_id
 
-        # CONTROLLER：H(t) ≥ θ 且非 DORM → 干预欲望
-        if (agent_type == AgentType.CONTROLLER
-                and group_type != GroupType.DORM
-                and current_heat >= THETA):
-            desires.append(Desire("intervene", priority=0.9, topic_id=topic_id))
+        # CONTROLLER 在自己加入的非 DORM 群中，对真正达到阈值的群执行干预。
+        hottest_type = self.model.get_group_type_by_id(hottest_group_id)
+        if (
+            agent_type == AgentType.CONTROLLER
+            and hottest_type is not None
+            and hottest_type != GroupType.DORM
+            and hottest_heat >= THETA
+        ):
+            desires.append(Desire(
+                "intervene",
+                priority=0.9,
+                topic_id=topic_id,
+                destination_group_id=hottest_group_id,
+            ))
 
-        # RATIONAL：高失真内容存在 → 澄清欲望
+        # RATIONAL 对一条具体高失真消息在其所在群内澄清。
         if agent_type == AgentType.RATIONAL and self._last_perception:
-            avg_distortion = float(np.mean([
-                si.distortion_level for si in self._last_perception.recent_messages
-            ])) if self._last_perception.recent_messages else 0.0
-            if avg_distortion > 0.5:
-                desires.append(Desire("clarify", priority=0.75, topic_id=topic_id))
+            distorted = max(
+                self._last_perception.recent_messages,
+                key=lambda si: si.distortion_level,
+                default=None,
+            )
+            if distorted is not None and distorted.distortion_level > 0.5:
+                desires.append(Desire(
+                    "clarify",
+                    priority=0.75,
+                    topic_id=distorted.topic_id or topic_id,
+                    target_id=distorted.source_id,
+                    source_message_id=distorted.message_id,
+                    source_group_id=distorted.group_id,
+                    destination_group_id=distorted.group_id,
+                ))
 
-        # 高唤醒且负面：优先讨论；正面高唤醒会提高后续转发优先级。
-        if e.arousal > 0.65 and e.valence < -0.2:
-            desires.append(Desire("discuss", priority=0.7, topic_id=topic_id))
+        if emotion.arousal > 0.65 and emotion.valence < -0.2:
+            desires.append(Desire(
+                "discuss",
+                priority=0.7,
+                topic_id=topic_id,
+                destination_group_id=hottest_group_id,
+            ))
 
-        # 转发欲望：所有角色均有概率产生，但必须绑定一条真实可见消息。
-        # target_id 记录被转发消息的原作者；是否跨群由 A 模块根据两者
-        # group_type 判定，不在这里人为偏向异群来源。
+        # 真实跨群转发：源消息来自当前可见流，目标群是发送者的另一成员群。
         forward_source = self._select_forward_source()
         if forward_source is not None:
+            destination_group_id = self.model.select_forward_destination(
+                self.unique_id,
+                forward_source.group_id,
+            )
             share_priority: Optional[float] = None
-            if self.model.random.random() < _SHARE_PROBABILITY[agent_type]:
-                share_priority = _SHARE_PRIORITY[agent_type]
+            if destination_group_id is not None:
+                if self.model.random.random() < _SHARE_PROBABILITY[agent_type]:
+                    share_priority = _SHARE_PRIORITY[agent_type]
+                if emotion.arousal > 0.65 and emotion.valence >= -0.2:
+                    share_priority = max(share_priority or 0.0, 0.65)
 
-            if e.arousal > 0.65 and e.valence >= -0.2:
-                share_priority = max(share_priority or 0.0, 0.65)
-
-            if share_priority is not None:
+            if share_priority is not None and destination_group_id is not None:
                 desires.append(Desire(
                     "share",
                     priority=share_priority,
                     topic_id=forward_source.topic_id or topic_id,
                     target_id=forward_source.source_id,
+                    source_message_id=forward_source.message_id,
+                    source_group_id=forward_source.group_id,
+                    destination_group_id=destination_group_id,
                 ))
 
-        # 背景欲望（所有角色）
-        desires.append(Desire("discuss",  priority=0.35, topic_id=topic_id))
-        desires.append(Desire("reply",    priority=0.25, topic_id=topic_id))
+        # 回复也绑定具体消息，并留在消息所在群。
+        reply_source = None
+        if self._last_perception and self._last_perception.recent_messages:
+            reply_source = self._last_perception.recent_messages[0]
 
-        desires.sort(key=lambda d: d.priority, reverse=True)
+        desires.append(Desire(
+            "discuss",
+            priority=0.35,
+            topic_id=topic_id,
+            destination_group_id=primary_group_id,
+        ))
+        if reply_source is not None:
+            desires.append(Desire(
+                "reply",
+                priority=0.25,
+                topic_id=reply_source.topic_id or topic_id,
+                target_id=reply_source.source_id,
+                source_message_id=reply_source.message_id,
+                source_group_id=reply_source.group_id,
+                destination_group_id=reply_source.group_id,
+            ))
+
+        desires.sort(key=lambda desire: desire.priority, reverse=True)
         return desires
 
     # ------------------------------------------------------------------ #
     #  #8  _plan_intentions                                                #
     # ------------------------------------------------------------------ #
     def _plan_intentions(self, desires: List[Desire]) -> Intention:
-        """
-        将欲望转化为具体行动意图（v2：ActionType 已更新）。
-        goal_type → ActionType 映射：
-          reply→REPLY, discuss→SEND_MESSAGE, share→FORWARD,
-          clarify→SEND_MESSAGE, intervene→SEND_MESSAGE(message_type=clarification),
-          silent→SILENT
-        """
+        """把规则欲望转换成带完整消息路由的可执行意图。"""
         if not desires:
-            return Intention(action_type=ActionType.SILENT, topic_id=self._get_primary_topic_id())
+            return Intention(
+                action_type=ActionType.SILENT,
+                topic_id=self._get_primary_topic_id(),
+                destination_group_id=self._get_primary_group_id(),
+            )
 
-        primary  = desires[0]
-        extra    = self.beliefs.psychology.personality.extraversion
-        arousal  = self.beliefs.emotion.arousal
-        risk_av  = self.beliefs.psychology.risk_aversion
+        primary = desires[0]
+        extraversion = self.beliefs.psychology.personality.extraversion
+        arousal = self.beliefs.emotion.arousal
+        risk_aversion = self.beliefs.psychology.risk_aversion
 
-        # 是否行动
-        p_act = extra * arousal * (1.0 - risk_av * 0.5)
+        p_act = extraversion * arousal * (1.0 - risk_aversion * 0.5)
         if self.model.random.random() > p_act:
-            return Intention(action_type=ActionType.SILENT, topic_id=primary.topic_id)
+            return Intention(
+                action_type=ActionType.SILENT,
+                topic_id=primary.topic_id,
+                destination_group_id=(
+                    primary.destination_group_id or self._get_primary_group_id()
+                ),
+            )
 
         action_map = {
-            "reply":    ActionType.REPLY,
-            "discuss":  ActionType.SEND_MESSAGE,
-            "share":    ActionType.FORWARD,
-            "clarify":  ActionType.SEND_MESSAGE,
-            "intervene":ActionType.SEND_MESSAGE,
+            "reply": ActionType.REPLY,
+            "discuss": ActionType.SEND_MESSAGE,
+            "share": ActionType.FORWARD,
+            "clarify": ActionType.SEND_MESSAGE,
+            "intervene": ActionType.SEND_MESSAGE,
         }
         action_type = action_map.get(primary.goal_type, ActionType.SILENT)
+        destination_group_id = (
+            primary.destination_group_id or self._get_primary_group_id()
+        )
+        destination_type = self.model.get_group_type_by_id(destination_group_id)
+        group_label = destination_type.name if destination_type is not None else destination_group_id
 
-        op_val  = self._get_primary_opinion_value()
-        stance  = "支持" if op_val > 0.1 else ("反对" if op_val < -0.1 else "观望")
-        role    = self.beliefs.identity.agent_type.name
-        group   = self.beliefs.identity.group_type.name
+        opinion_value = self._get_primary_opinion_value()
+        stance = (
+            "支持" if opinion_value > 0.1
+            else "反对" if opinion_value < -0.1
+            else "观望"
+        )
+        role = self.beliefs.identity.agent_type.name
 
-        if action_type == ActionType.FORWARD and primary.target_id is not None:
-            source_info = None
-            if self._last_perception is not None:
-                source_info = next(
-                    (
-                        si for si in self._last_perception.recent_messages
-                        if si.source_id == primary.target_id
-                    ),
-                    None,
-                )
+        source_info = self._find_perceived_message(primary.source_message_id)
+        if action_type == ActionType.FORWARD:
             source_label = (
                 source_info.source_nickname
                 if source_info is not None and source_info.source_nickname
@@ -554,13 +677,19 @@ class SocialAgent(Agent):
             if len(source_text) > 100:
                 source_text = source_text[:97] + "..."
             content = (
-                f"[{group}/{role}] {self.beliefs.identity.nickname} "
-                f"转发自{source_label}：{source_text}"
+                f"[{group_label}/{role}] {self.beliefs.identity.nickname} "
+                f"从{primary.source_group_id}转发自{source_label}：{source_text}"
+            )
+        elif action_type == ActionType.REPLY and source_info is not None:
+            content = (
+                f"[{group_label}/{role}] {self.beliefs.identity.nickname} "
+                f"回复{source_info.source_nickname or source_info.source_id}："
+                f"对话题{primary.topic_id}表示{stance}"
             )
         else:
             content = (
-                f"[{group}/{role}] Agent-{self.unique_id}({self.beliefs.identity.nickname}) "
-                f"对话题{primary.topic_id}表示{stance}"
+                f"[{group_label}/{role}] Agent-{self.unique_id}"
+                f"({self.beliefs.identity.nickname}) 对话题{primary.topic_id}表示{stance}"
             )
 
         return Intention(
@@ -568,115 +697,168 @@ class SocialAgent(Agent):
             content_plan=content,
             topic_id=primary.topic_id,
             target_id=primary.target_id,
+            source_message_id=primary.source_message_id,
+            source_group_id=primary.source_group_id,
+            destination_group_id=destination_group_id,
         )
 
     # ------------------------------------------------------------------ #
     #  #9  _execute_action                                                 #
     # ------------------------------------------------------------------ #
     def _execute_action(self, intention: Intention) -> Dict[str, float]:
-        """
-        执行意图，构造 v2 ActionRecord（新增 distortion_level/message_type/negative_score/heat）。
-        SILENT：不写 memory，不调 submit_action。
-        CONTROLLER 且非 DORM：写 self.intervention_tick（参考值；权威由 A 维护）。
-        """
+        """执行带明确来源群与目标群的意图，并交由 A 模块校验投递。"""
         self.pending_action = None
-
         if intention.action_type == ActionType.SILENT:
             return {}
 
-        tick       = int(self.model.schedule.time)
+        tick = int(self.model.schedule.time)
         agent_type = self.beliefs.identity.agent_type
-        group_type = self.beliefs.identity.group_type
-        op_val     = self._get_primary_opinion_value()
+        destination_group_id = (
+            intention.destination_group_id or self._get_primary_group_id()
+        )
+        destination_group_type = self.model.get_group_type_by_id(destination_group_id)
+        if destination_group_type is None:
+            _LOG.debug(
+                "Agent-%s 目标群无效，行动降级 SILENT: %r",
+                self.unique_id,
+                destination_group_id,
+            )
+            return {}
 
-        # 确定 message_type
-        if intention.action_type == ActionType.FORWARD:
-            if agent_type == AgentType.ACTIVE:
-                msg_type = MessageType.FORWARD
-            else:
-                msg_type = MessageType.PARAPHRASE
+        opinion_value = self._get_primary_opinion_value()
+
+        requested_message_type = str(getattr(intention, "message_type", "") or "").lower()
+        legal_message_types = {
+            MessageType.ORIGINAL,
+            MessageType.FORWARD,
+            MessageType.PARAPHRASE,
+            MessageType.EXAGGERATE,
+            MessageType.CLARIFICATION,
+        }
+        if requested_message_type in legal_message_types:
+            message_type = requested_message_type
+        elif intention.action_type == ActionType.FORWARD:
+            message_type = (
+                MessageType.FORWARD
+                if agent_type == AgentType.ACTIVE
+                else MessageType.PARAPHRASE
+            )
         elif agent_type == AgentType.CONTROLLER:
-            msg_type = MessageType.CLARIFICATION
+            message_type = MessageType.CLARIFICATION
         elif agent_type == AgentType.RATIONAL:
-            msg_type = MessageType.ORIGINAL
+            message_type = MessageType.ORIGINAL
+        elif (
+            self.beliefs.emotion.arousal > 0.75
+            and self.beliefs.emotion.valence < -0.3
+        ):
+            message_type = MessageType.EXAGGERATE
         else:
-            # ORDINARY / ACTIVE 发原创时，根据情绪决定是否夸大
-            if self.beliefs.emotion.arousal > 0.75 and self.beliefs.emotion.valence < -0.3:
-                msg_type = MessageType.EXAGGERATE
-            else:
-                msg_type = MessageType.ORIGINAL
+            message_type = MessageType.ORIGINAL
 
-        # 计算 distortion_level
+        # FORWARD 的内容语义只能是直接转发或转述；Controller 的非转发干预保持澄清。
+        if intention.action_type == ActionType.FORWARD and message_type not in {
+            MessageType.FORWARD,
+            MessageType.PARAPHRASE,
+        }:
+            message_type = MessageType.FORWARD
+        if (
+            agent_type == AgentType.CONTROLLER
+            and intention.action_type != ActionType.FORWARD
+        ):
+            message_type = MessageType.CLARIFICATION
+
         distortion_map = {
-            MessageType.ORIGINAL:      0.0,
-            MessageType.FORWARD:       0.05,
-            MessageType.PARAPHRASE:    0.25,
-            MessageType.EXAGGERATE:    0.70,
+            MessageType.ORIGINAL: 0.0,
+            MessageType.FORWARD: 0.05,
+            MessageType.PARAPHRASE: 0.25,
+            MessageType.EXAGGERATE: 0.70,
             MessageType.CLARIFICATION: 0.0,
         }
-        distortion_level = float(distortion_map.get(msg_type, 0.0))
-        # RATIONAL 角色总是低失真
+        distortion_level = float(distortion_map.get(message_type, 0.0))
         if agent_type == AgentType.RATIONAL:
             distortion_level = min(distortion_level, 0.1)
 
-        # negative_score：与情绪效价负相关
-        negative_score = float(np.clip((1.0 - self.beliefs.emotion.valence) / 2.0, 0.0, 1.0))
-        if msg_type == MessageType.CLARIFICATION:
+        negative_score = float(np.clip(
+            (1.0 - self.beliefs.emotion.valence) / 2.0,
+            0.0,
+            1.0,
+        ))
+        if message_type == MessageType.CLARIFICATION:
             negative_score = max(0.0, negative_score - 0.3)
 
-        # heat 贡献：基于 extraversion 和当前热度
         topic_heat_now = 0.0
         if self._last_perception:
-            topic_heat_now = self._last_perception.topic_heat.get(intention.topic_id, 0.0)
+            topic_heat_now = self._last_perception.topic_heat_by_group.get(
+                destination_group_id,
+                {},
+            ).get(intention.topic_id, 0.0)
         heat = float(np.clip(
-            self.beliefs.psychology.personality.extraversion * (1 + topic_heat_now * 0.1),
-            0.0, 2.0,
+            self.beliefs.psychology.personality.extraversion
+            * (1 + topic_heat_now * 0.1),
+            0.0,
+            2.0,
         ))
+
+        content = intention.content_plan.strip()
+        if not content:
+            content = (
+                f"[{destination_group_type.name}/{agent_type.name}] "
+                f"{self.beliefs.identity.nickname} 关于{intention.topic_id}的消息"
+            )
 
         record = ActionRecord(
             agent_id=self.unique_id,
             action_type=intention.action_type,
-            content=intention.content_plan,
+            content=content,
             target_id=intention.target_id,
             tick=tick,
             topic_id=intention.topic_id,
             distortion_level=distortion_level,
-            message_type=msg_type,
+            message_type=message_type,
             negative_score=negative_score,
             heat=heat,
+            group_id=destination_group_id,
+            source_message_id=intention.source_message_id,
+            source_group_id=intention.source_group_id,
         )
 
-        # 写 memory
+        accepted = bool(self.model.submit_action(record))
+        if not accepted:
+            return {}
+
+        self.pending_action = record
         self.memory.append(MemoryRecord(
             tick=tick,
             info=SocialInfo(
                 source_id=self.unique_id,
                 source_nickname=self.beliefs.identity.nickname,
                 content=record.content,
-                message_type=msg_type,
+                message_type=message_type,
                 timestamp=tick,
                 topic_id=intention.topic_id,
                 distortion_level=distortion_level,
                 negative_score=negative_score,
                 heat=heat,
+                message_id=record.message_id,
+                group_id=record.group_id,
+                source_message_id=record.source_message_id,
+                source_group_id=record.source_group_id,
             ),
             relevance=1.0,
         ))
 
-        self.pending_action = record
-        self.model.submit_action(record)
-
-        # CONTROLLER 非 DORM：记录参考性 intervention_tick
-        if (agent_type == AgentType.CONTROLLER
-                and group_type != GroupType.DORM
-                and self.intervention_tick is None):
+        if (
+            agent_type == AgentType.CONTROLLER
+            and destination_group_type != GroupType.DORM
+            and self.intervention_tick is None
+        ):
             self.intervention_tick = tick
 
         return {
-            "submitted":      1.0,
-            "opinion_value":  op_val,
+            "submitted": 1.0,
+            "opinion_value": opinion_value,
             "negative_score": negative_score,
-            "heat":           heat,
+            "heat": heat,
         }
 
     # ------------------------------------------------------------------ #
@@ -748,25 +930,159 @@ class SocialAgent(Agent):
     #  内部辅助                                                            #
     # ------------------------------------------------------------------ #
     def _select_forward_source(self) -> Optional[SocialInfo]:
-        """
-        从本次感知中选择一条可转发消息。
-
-        从最近 5 条可见消息中随机选择；异群消息进入候选池的概率由 A 模块
-        cross_group_visibility 控制，因此这里不额外放大跨群转发比例。
-        返回值的 source_id 会写入 FORWARD ActionRecord.target_id。
-        """
+        """选择一条可被投递到另一个成员群的真实可见消息。"""
         if self._last_perception is None:
             return None
 
         candidates = [
-            si for si in self._last_perception.recent_messages
-            if si.source_id != self.unique_id and bool(si.content.strip())
+            social_info
+            for social_info in self._last_perception.recent_messages
+            if social_info.source_id != self.unique_id
+            and bool(social_info.content.strip())
+            and bool(social_info.message_id)
+            and bool(social_info.group_id)
+            and bool(self.model.get_forward_destination_candidates(
+                self.unique_id,
+                social_info.group_id,
+            ))
         ]
         if not candidates:
             return None
-
-        # recent_messages 已按“从新到旧”排序；限制在前 5 条兼顾最近性与多样性。
         return self.model.random.choice(candidates[:5])
+
+    def _find_perceived_message(self, message_id: Optional[str]) -> Optional[SocialInfo]:
+        if not message_id or self._last_perception is None:
+            return None
+        return next(
+            (
+                social_info
+                for social_info in self._last_perception.recent_messages
+                if social_info.message_id == message_id
+            ),
+            None,
+        )
+
+    def _get_primary_group_id(self) -> str:
+        identity = self.beliefs.identity
+        return (
+            getattr(identity, "primary_group_id", "")
+            or self.model.get_agent_group(self.unique_id)
+            or f"GROUP_{identity.group_type.name}"
+        )
+
+    def _intention_from_llm_result(
+        self,
+        result: Dict[str, Any],
+        perception: Perception,
+    ) -> Optional[Intention]:
+        """校验 LLM 行动 JSON，并转换成可执行意图；无效幻觉路由返回 None。"""
+        raw_action_name = result.get("action_type_name")
+        if not raw_action_name:
+            raw_action = result.get("action_type", ActionType.SILENT)
+            raw_action_name = getattr(raw_action, "name", str(raw_action))
+        action_name = str(raw_action_name).upper().split(".")[-1]
+        action_map = {
+            "SEND_MESSAGE": ActionType.SEND_MESSAGE,
+            "REPLY": ActionType.REPLY,
+            "FORWARD": ActionType.FORWARD,
+            "SILENT": ActionType.SILENT,
+        }
+        action_type = action_map.get(action_name, ActionType.SILENT)
+        topic_id = str(result.get("topic_id") or self._get_primary_topic_id())
+        primary_group_id = self._get_primary_group_id()
+
+        if action_type == ActionType.SILENT:
+            return Intention(
+                action_type=ActionType.SILENT,
+                topic_id=topic_id,
+                destination_group_id=primary_group_id,
+            )
+
+        member_group_ids = set(perception.group_ids or [primary_group_id])
+        destination_group_id = str(result.get("destination_group_id") or "").strip()
+        source_message_id_raw = result.get("source_message_id")
+        source_message_id = (
+            str(source_message_id_raw).strip()
+            if source_message_id_raw not in (None, "")
+            else None
+        )
+        target_id = result.get("target_id")
+        try:
+            target_id = int(target_id) if target_id is not None else None
+        except (TypeError, ValueError):
+            target_id = None
+
+        source_info = self._find_perceived_message(source_message_id)
+        if source_info is None and target_id is not None:
+            source_info = next(
+                (
+                    social_info
+                    for social_info in perception.recent_messages
+                    if social_info.source_id == target_id
+                ),
+                None,
+            )
+
+        source_group_id = str(result.get("source_group_id") or "").strip()
+        if source_info is not None:
+            source_message_id = source_info.message_id
+            source_group_id = source_info.group_id
+            target_id = source_info.source_id
+            if not result.get("topic_id"):
+                topic_id = source_info.topic_id or topic_id
+
+        if action_type == ActionType.FORWARD:
+            if source_info is None:
+                _LOG.debug(
+                    "Agent-%s 丢弃 LLM FORWARD：source_message_id/target_id 未命中可见消息",
+                    self.unique_id,
+                )
+                return None
+            valid_destinations = self.model.get_forward_destination_candidates(
+                self.unique_id,
+                source_info.group_id,
+            )
+            if destination_group_id not in valid_destinations:
+                destination_group_id = self.model.select_forward_destination(
+                    self.unique_id,
+                    source_info.group_id,
+                ) or ""
+            if not destination_group_id:
+                return None
+        elif action_type == ActionType.REPLY:
+            if source_info is None:
+                _LOG.debug(
+                    "Agent-%s 丢弃 LLM REPLY：未命中可见源消息",
+                    self.unique_id,
+                )
+                return None
+            # 回复必须留在被回复消息所在群。
+            destination_group_id = source_info.group_id
+        elif destination_group_id not in member_group_ids:
+            destination_group_id = primary_group_id
+
+        content = str(result.get("content") or "").strip()
+        if not content and action_type == ActionType.FORWARD and source_info is not None:
+            content = (
+                f"[{destination_group_id}] {self.beliefs.identity.nickname} "
+                f"从{source_info.group_id}转发：{source_info.content}"
+            )
+        elif not content:
+            content = (
+                f"[{destination_group_id}] {self.beliefs.identity.nickname} "
+                f"关于{topic_id}的消息"
+            )
+
+        return Intention(
+            action_type=action_type,
+            content_plan=content,
+            topic_id=topic_id,
+            target_id=target_id,
+            source_message_id=source_message_id,
+            source_group_id=source_group_id,
+            destination_group_id=destination_group_id or primary_group_id,
+            message_type=str(result.get("message_type") or ""),
+        )
 
     def _get_primary_opinion_value(self) -> float:
         """返回第一个话题的观点值，默认 0.0。"""

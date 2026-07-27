@@ -10,7 +10,8 @@ Aligned with:
 
 B module call path:
   build_prompt(belief, memory, env_info: Dict) -> chat -> parse_llm_response
-  uses: opinion_updates, emotion_delta
+  uses: opinion_updates, emotion_delta, action_type, target_id,
+        source_message_id/source_group_id/destination_group_id
 """
 
 from __future__ import annotations
@@ -97,6 +98,9 @@ class MockLLMClient:
                 "topic_id": "",
                 "opinion_value": 0.0,
                 "target_id": None,
+                "source_message_id": None,
+                "source_group_id": "",
+                "destination_group_id": "",
                 "opinion_updates": {},
                 "emotion_delta": {"valence": 0.0, "arousal": 0.0},
             },
@@ -256,7 +260,10 @@ def build_prompt(belief: Any, memory: List[Any], env_info: Any) -> str:
         "content": "string, campus WeChat-style short message; empty if SILENT",
         "topic_id": "string, e.g. T001",
         "opinion_value": "float in [-1,1]",
-        "target_id": "int|null",
+        "target_id": "int|null; FORWARD/REPLY 时为源消息作者",
+        "source_message_id": "string|null; 必须从 ENV.recent_messages 选择",
+        "source_group_id": "string; 源消息所在群",
+        "destination_group_id": "string; 实际发入的群，必须属于 ENV.group_ids",
         "opinion_updates": {"T001": "float in [-1,1]"},
         "emotion_delta": {"valence": "float", "arousal": "float"},
     }
@@ -269,8 +276,12 @@ def build_prompt(belief: Any, memory: List[Any], env_info: Any) -> str:
         "5) ACTIVE 扩散时可用 forward/paraphrase/exaggerate；RATIONAL 避免 exaggerate。",
         "6) opinion_updates 用于更新对 topic 的立场；emotion_delta 为相对变化量，幅度建议较小（如 |delta|<=0.3）。",
         "7) 结合 topic_heat / topic_negative：热度高且负面高时，更应降温或求证，而非继续夸大。",
-        f"8) 角色约束：{role_hint}",
-        f"9) 群约束：{group_hint}",
+        "8) FORWARD 必须从 ENV.recent_messages 选择真实 source_message_id；"
+        "source_group_id 必须等于该消息 group_id；destination_group_id 必须在 ENV.group_ids 中且与来源群不同。",
+        "9) REPLY 的 destination_group_id 必须等于被回复消息的 group_id；target_id 填消息作者 source_id。",
+        "10) SEND_MESSAGE 的 destination_group_id 必须在 ENV.group_ids 中。不要编造消息 ID、Agent ID 或群 ID。",
+        f"11) 角色约束：{role_hint}",
+        f"12) 主群约束：{group_hint}",
     ]
 
     return (
@@ -380,6 +391,17 @@ def _normalize_response(data: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             out["target_id"] = None
 
+    source_message_id = data.get("source_message_id", None)
+    if source_message_id is None or str(source_message_id).strip().lower() in {"", "null"}:
+        out["source_message_id"] = None
+    else:
+        out["source_message_id"] = str(source_message_id).strip()
+
+    out["source_group_id"] = str(data.get("source_group_id", "") or "").strip()
+    out["destination_group_id"] = str(
+        data.get("destination_group_id", data.get("group_id", "")) or ""
+    ).strip()
+
     # ---- opinion_updates (topic_id -> float) ----
     opinion_updates = data.get("opinion_updates", {})
     if isinstance(opinion_updates, dict):
@@ -417,6 +439,9 @@ def _silent_response() -> Dict[str, Any]:
         "event_id": "",
         "opinion_value": 0.0,
         "target_id": None,
+        "source_message_id": None,
+        "source_group_id": "",
+        "destination_group_id": "",
         "opinion_updates": {},
         "emotion_delta": {"valence": 0.0, "arousal": 0.0},
     }

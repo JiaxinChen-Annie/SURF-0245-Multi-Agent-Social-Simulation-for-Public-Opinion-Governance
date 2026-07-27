@@ -97,6 +97,8 @@ def run(config_path: str, save_plot: bool = True) -> None:
     print(f"  AgentType   : {config.agent_type_ratio}")
     print(f"  GroupType   : {config.group_type_ratio}")
     print(f"  网络类型    : {config.network_type}")
+    print(f"  群成员模式  : {config.network_params.get('group_membership_mode', 'hierarchical')}")
+    print(f"  转发目标策略: {config.network_params.get('forward_destination_strategy', 'next_larger')}")
     print(f"  运行步数    : {config.n_steps}")
     print(f"  随机种子    : {config.random_seed}")
 

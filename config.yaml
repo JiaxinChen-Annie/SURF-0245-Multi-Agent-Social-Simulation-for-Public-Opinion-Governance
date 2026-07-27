@@ -27,7 +27,9 @@ group_type_ratio:
 network_type: "barabasi_albert"   # 无标度网络（幂律分布，类似真实社交网络）
 network_params:
   m: 3                             # 每个新节点连接 m 条边
-  cross_group_visibility: 0.10     # 异群消息进入当前 Agent 感知流的概率
+  group_membership_mode: "hierarchical"  # 主群向上加入更大群：DORM→CLASS→MAJOR→CAMPUS
+  forward_destination_strategy: "next_larger"  # 默认逐层转发到下一个更大群
+  allow_downward_forward: false    # 默认只模拟小群→大群扩散
   cross_group_spread_probability: 0.15  # 宏观热度向其他群扩散的概率
 
 n_steps: 50
@@ -51,6 +53,7 @@ hawkes_params:
 # 方式 C：接入 DeepSeek 真实 API
 #   llm_config:
 #     provider: deepseek
+#     use_actions: true      # LLM action_type/target/群路由直接驱动执行
 #     api_key: ""            # 留空则读环境变量 DEEPSEEK_API_KEY
 #     model: deepseek-v4-flash
 #     temperature: 0.3
@@ -58,8 +61,7 @@ hawkes_params:
 #     max_retries: 2
 #     fallback_mock: true    # Key 失效 / 网络错误时自动降级，不崩溃
 #
-# ── 当前设置（方式 B，联调冒烟验证推荐）──────────────────────────────────
-llm_config:
-  provider: mock            # 改为 deepseek 即接入真实 API
+# ── 当前设置：规则模式。Mock 默认返回 SILENT，不适合作为行为仿真默认值。──────
+llm_config: {}
 
 random_seed: null   # null = 每次随机种子
