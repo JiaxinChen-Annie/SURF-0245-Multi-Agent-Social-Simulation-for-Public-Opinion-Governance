@@ -1,5 +1,5 @@
 """
-run_sim.py — 仿真主入口（W4 版本）
+run_sim.py — 仿真主入口（v3 场景对齐版）
 ---------------------------------------
 用法：
     python3 run_sim.py                              # 使用默认 config.yaml（100 agents）
@@ -14,6 +14,7 @@ run_sim.py — 仿真主入口（W4 版本）
     ✓ 1000 Agent 无调度冲突
     ✓ DataCollector 指标含接口表§5 全部字段
     ✓ 热度演化公式正确（CAMPUS 衰减最快）
+    ✓ 场景一致性：事件源投放 / 四条转发通道 / 禁言公告 / 干预与恢复
 """
 
 from __future__ import annotations
@@ -65,6 +66,15 @@ def load_config(path: str) -> SimConfig:
     """从 YAML/JSON 文件读取仿真配置，返回 SimConfig 实例。"""
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
+    from types_def import DEFAULT_SCENARIO_PARAMS
+    scenario = dict(DEFAULT_SCENARIO_PARAMS)
+    for key, value in (raw.get("scenario_params") or {}).items():
+        if isinstance(value, dict) and isinstance(scenario.get(key), dict):
+            merged = dict(scenario[key])
+            merged.update(value)
+            scenario[key] = merged
+        else:
+            scenario[key] = value
     return SimConfig(
         n_agents         = raw.get("n_agents",         100),
         agent_type_ratio = raw.get("agent_type_ratio", {}),
@@ -74,7 +84,9 @@ def load_config(path: str) -> SimConfig:
         n_steps          = raw.get("n_steps",          50),
         hawkes_params    = raw.get("hawkes_params",    {"mu": 0.1, "alpha": 0.5, "beta": 1.0}),
         llm_config       = raw.get("llm_config",       {}),
-        random_seed      = (raw.get("random_seed") or __import__('random').randint(0, 2**31)),
+        random_seed      = (raw.get("random_seed") if raw.get("random_seed") is not None
+                            else __import__('random').randint(0, 2**31 - 1)),
+        scenario_params  = scenario,
     )
 
 
@@ -85,7 +97,7 @@ def load_config(path: str) -> SimConfig:
 def run(config_path: str, save_plot: bool = True) -> None:
     banner = "=" * 65
     print(f"\n{banner}")
-    print("  多智能体舆情仿真 · W4 自测  (模块二 OpinionModel v2)")
+    print("  多智能体舆情仿真 · A 模块自测  (模块二 OpinionModel v3)")
     print(f"  场景：大学校园多群舆情扩散")
     print(f"{banner}")
 
@@ -101,6 +113,11 @@ def run(config_path: str, save_plot: bool = True) -> None:
     print(f"  转发目标策略: {config.network_params.get('forward_destination_strategy', 'next_larger')}")
     print(f"  运行步数    : {config.n_steps}")
     print(f"  随机种子    : {config.random_seed}")
+    sp = config.scenario_params
+    print(f"  干预触发    : {sp.get('intervention_trigger')} "
+          f"(负面阈={sp.get('negative_threshold')} / 热度阈={sp.get('heat_threshold')})")
+    print(f"  跨群门槛    : {sp.get('cross_group_forward_threshold_by_direction')}")
+    print(f"  禁言开关    : {sp.get('enable_mute')}")
 
     _LOG.info("初始化 OpinionModel ...")
     t0 = time.perf_counter()
@@ -121,8 +138,10 @@ def run(config_path: str, save_plot: bool = True) -> None:
                 f"avg_opinion={last['avg_opinion']:+.3f} | "
                 f"polarization={last['polarization']:.3f} | "
                 f"msg_count={last['message_count']:5.0f} | "
+                f"H_max={last['group_heat_max']:.2f} | "
+                f"neg_max={last['group_negative_max']:.2f} | "
                 f"cross_fwd={last['cross_group_forward']:4.0f} | "
-                f"heat_spread={last['cross_group_spread']:4.0f}"
+                f"mute={last['mute_count']:3.0f}"
             )
 
     t_run = time.perf_counter() - t_start
@@ -158,12 +177,38 @@ def run(config_path: str, save_plot: bool = True) -> None:
     op_end   = df["avg_opinion"].iloc[-1]
     print(f"  ⑤ 观点演化: {op_start:+.3f} → {op_end:+.3f}")
 
-    print(f"  ⑥ Agent 实际跨群转发: 累计 {int(df['cross_group_forward'].iloc[-1])} 次")
-    print(f"     宏观热度跨群扩散:   累计 {int(df['cross_group_spread'].iloc[-1])} 次")
-    int_tick = df["intervention_tick"].iloc[-1]
-    print(f"  ⑦ 最早干预时刻: {int_tick} tick")
+    summary = model.get_final_summary()
+    print(f"  ⑥ 转发通道分解（问题③④）:")
+    print(f"     群内转发 {summary['intra_group_forward']:5d} 次  ← 攒够转发次数的唯一途径")
+    print(f"     小→大    {summary['upward_forward']:5d} 次  ← 主通道")
+    print(f"     小群互转 {summary['lateral_forward']:5d} 次  ← DORM↔CLASS 横向（弱）")
+    print(f"     大→小    {summary['downward_forward']:5d} 次  ← 向下（最弱）")
+    print(f"     跨群合计 {summary['cross_group_forward']:5d} 次 | "
+          f"被门槛拦下 {summary['blocked_by_forward_gate']} 次")
+    print(f"     宏观热度溅射 {summary['cross_group_spread']} 次（与人际转发分开计数）")
 
-    all_pass = time_ok and rows_ok and cols_ok and nan_ok
+    ev = summary["event_source"]
+    print(f"  ⑦ 事件源（问题②）: 共投放 {ev['n_events']} 次"
+          f"（初始 {ev['n_initial']} / 二次 {ev['n_secondary']}）")
+    for e in ev["events"]:
+        print(f"     tick={e['tick']:3d} Agent-{e['origin_agent_id']:<4d} → {e['group_id']:<13s}"
+              f" ({'小群' if e['scope'] == 'small' else '大群'})"
+              f" H0={e['heat']:.2f} neg={e['negative_score']:.2f}")
+
+    print(f"  ⑧ 干预与恢复（问题①⑤⑦）:")
+    print(f"     触发阈值时刻 t_int  : {summary['intervention_tick_by_group']}")
+    print(f"     Controller 实际动手 : "
+          f"{ {g.name: t for g, t in model.governance_tick.items() if t is not None} }")
+    print(f"     禁言 {summary['mute_count']} 次 / 公告 {summary['announce_count']} 次"
+          f" / 因禁言被拦 {summary['blocked_by_mute']} 条")
+    print(f"     峰值热度 {df['group_heat_max'].max():.3f} | "
+          f"峰值群负面 {df['group_negative_max'].max():.3f} | "
+          f"recovery_time = {summary['recovery_time']}")
+    print(f"     control_level: {summary['control_level_by_group']}")
+    print(f"     曝光 exposure: {summary['exposure_by_group']}")
+
+    scenario_ok = ev["n_events"] > 0
+    all_pass = time_ok and rows_ok and cols_ok and nan_ok and scenario_ok
     print(f"\n  综合评分: {'✅ 全部通过' if all_pass else '❌ 存在未通过项'}")
     print(f"{'─'*65}")
 
@@ -209,9 +254,25 @@ def _plot_trends(df, config: SimConfig, out_dir: str) -> None:
     _sub(0, 0, df["avg_opinion"],         "#2563EB", "平均观点值",     "① 全网平均观点",      (-1.05, 1.05))
     _sub(0, 1, df["polarization"],        "#DC2626", "极化程度(std)",  "② 观点极化程度")
     _sub(1, 0, df["emotional_contagion"], "#7C3AED", "情绪传播速度",   "③ 情绪传播速度")
-    _sub(1, 1, df["message_count"],       "#16A34A", "消息总量",       "④ 信息流消息量")
-    _sub(2, 0, df["negative_emotion"],    "#EA580C", "负面情绪比例",   "⑤ 负面情绪指数",      (0, 1.05))
-    _sub(2, 1, df["cross_group_forward"], "#0891B2", "Agent 跨群转发次数", "⑥ 实际跨群转发累计")
+    ax4 = _sub(1, 1, df["message_count"], "#16A34A", "消息总量 / 热度", "④ 信息流消息量与群热度峰值")
+    ax4b = ax4.twinx()
+    ax4b.plot(steps, df["group_heat_max"], color="#CA8A04", linewidth=1.2, linestyle="--")
+    ax4b.axhline(config.scenario_params.get("heat_threshold", 0.70),
+                 color="#78350F", linewidth=0.9, linestyle=":")
+    ax4b.set_ylabel("群热度 H (虚线) / θ (点线)", fontsize=8)
+    ax5 = _sub(2, 0, df["negative_emotion"], "#EA580C", "负面强度", "⑤ 负面情绪与群负面程度", (0, 1.05))
+    ax5.plot(steps, df["group_negative_max"], color="#B91C1C", linewidth=1.2, linestyle="--",
+             label="群负面程度(触发量)")
+    ax5.axhline(config.scenario_params.get("negative_threshold", 0.65),
+                color="#7F1D1D", linewidth=0.9, linestyle=":", label="干预阈值")
+    ax5.lines[0].set_label("全网负面情绪")
+    ax5.legend(fontsize=7, loc="lower right")
+    ax6 = _sub(2, 1, df["cross_group_forward"], "#0891B2", "累计转发次数", "⑥ 跨群转发通道分解")
+    ax6.plot(steps, df["upward_forward"],   color="#1D4ED8", linewidth=1.2, label="小→大（主）")
+    ax6.plot(steps, df["lateral_forward"],  color="#F59E0B", linewidth=1.2, label="小群互转")
+    ax6.plot(steps, df["downward_forward"], color="#94A3B8", linewidth=1.2, label="大→小")
+    ax6.lines[0].set_label("跨群合计")
+    ax6.legend(fontsize=7, loc="upper left")
 
     img_path = os.path.join(out_dir, "simulation_trends_w4.png")
     plt.savefig(img_path, dpi=150, bbox_inches="tight")

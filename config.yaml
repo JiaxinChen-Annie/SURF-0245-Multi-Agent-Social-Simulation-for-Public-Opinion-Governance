@@ -3,65 +3,110 @@
 # 用法：python3 run_sim.py
 #       python3 run_sim.py --config config.yaml
 #
-# 【v2 变更】
-#   agent_type_ratio 键名对齐新 AgentType: ORDINARY/ACTIVE/RATIONAL/CONTROLLER
-#   新增 group_type_ratio: DORM/CLASS/MAJOR/CAMPUS
-#
-# 【W4 LLM 变更】
-#   llm_config 新增完整配置字段，详见下方注释
+# 【v3 变更：对齐《场景设定_20260718_v2》与流程图】
+#   ① 干预触发默认改为「负面程度超阈」，热度阈值单列 heat_threshold
+#   ② 事件源独立成 event_source.py，可投小群或大群，可追加二次事件
+#   ③ 新增跨群转发次数门槛（按方向分级）
+#   ④ 新增 DORM↔CLASS 小群互转与向下通道（弱权重）
+#   ⑤ 新增 Controller 禁言 / 公告
+#   ⑥ 新增群曝光度（写死在 types_def.GROUP_EXPOSURE，此处只调影响力度）
+#   ⑦ 降温统一为「基础降温 × control_level」
 
 n_agents: 100
 
 agent_type_ratio:
-  ORDINARY:    0.70   # 70 个普通群员（多数沉默，偶尔附和/提问）
-  ACTIVE:      0.10   # 10 个活跃讨论者（乐于转发、分享信息）
-  RATIONAL:    0.10   # 10 个理性讨论者（质疑信息真实性）
-  CONTROLLER:  0.10   # 10 个管理者（提醒、澄清、禁言、公告）
+  ORDINARY:    0.70   # 普通群员（多数沉默，偶尔附和/提问）
+  ACTIVE:      0.10   # 活跃讨论者（乐于转发、分享信息）
+  RATIONAL:    0.10   # 理性讨论者（质疑信息真实性）
+  CONTROLLER:  0.10   # 管理者（提醒、澄清、禁言、公告）
 
-group_type_ratio:
-  DORM:   0.25   # 宿舍群（管理强度很弱，β₁=0.05）
-  CLASS:  0.35   # 班级群（管理强度中弱，β₂=0.12）
-  MAJOR:  0.25   # 专业群（管理强度中，β₃=0.20）
-  CAMPUS: 0.15   # 校园群（管理强度强，β₄=0.30）
+group_type_ratio:     # 这是「主群 / 最小群」的比例，成员关系向上层级包含
+  DORM:   0.25        # 宿舍群（管理很弱 control_level≈1.33，曝光低 0.20）
+  CLASS:  0.35        # 班级群（管理中弱 control_level=1.80，曝光中 0.50）
+  MAJOR:  0.25        # 专业群（管理中   control_level≈2.33，曝光中高 0.75）
+  CAMPUS: 0.15        # 校园群（管理强   control_level=3.00，曝光高 1.00）
 
-network_type: "barabasi_albert"   # 无标度网络（幂律分布，类似真实社交网络）
+network_type: "barabasi_albert"
 network_params:
-  m: 3                             # 每个新节点连接 m 条边
-  group_membership_mode: "hierarchical"  # 主群向上加入更大群：DORM→CLASS→MAJOR→CAMPUS
-  forward_destination_strategy: "next_larger"  # 默认逐层转发到下一个更大群
-  allow_downward_forward: false    # 默认只模拟小群→大群扩散
-  cross_group_spread_probability: 0.15  # 宏观热度向其他群扩散的概率
+  m: 3
+  group_membership_mode: "hierarchical"      # DORM→CLASS→MAJOR→CAMPUS 向上包含
+  forward_destination_strategy: "weighted"   # weighted | next_larger | largest | random
+  cross_group_spread_probability: 0.15       # 宏观热度溅射基准概率
 
 n_steps: 50
 
 hawkes_params:
-  mu:    0.1    # 基线强度
-  alpha: 0.5    # 激励系数
-  beta:  1.0    # 衰减系数
+  mu:    0.1
+  alpha: 0.5
+  beta:  1.0
 
-# ── LLM 配置（W4 新增）────────────────────────────────────────────────────
-#
-# 三种使用方式：
-#
-# 方式 A：本地测试（无需 API Key，Agent 全部走规则存根）
-#   llm_config: {}
-#
-# 方式 B：Mock 模式（import llm_utils 成功，但不调真实 API）
-#   llm_config:
-#     provider: mock
-#
-# 方式 C：接入 DeepSeek 真实 API
-#   llm_config:
-#     provider: deepseek
-#     use_actions: true      # LLM action_type/target/群路由直接驱动执行
-#     api_key: ""            # 留空则读环境变量 DEEPSEEK_API_KEY
-#     model: deepseek-v4-flash
-#     temperature: 0.3
-#     timeout: 30
-#     max_retries: 2
-#     fallback_mock: true    # Key 失效 / 网络错误时自动降级，不崩溃
-#
-# ── 当前设置：规则模式。Mock 默认返回 SILENT，不适合作为行为仿真默认值。──────
+# ── 场景仿真参数（逐条对应《场景设定》与流程图）──────────────────────────
+scenario_params:
+
+  # ① 干预触发 ——《场景设定》§3「负面程度超过阈值 → controller 开始干预」
+  intervention_trigger: "negative"   # negative | heat | heat_or_negative | heat_and_negative
+  negative_threshold: 0.65           # 负面程度阈值（触发 Controller 的主条件）
+  heat_threshold: 0.70               # 热度阈值 θ，单列出来，不再和负面阈值混用
+  intervention_requires_controller: true
+  intervention_min_messages: 4       # 群内至少这么多条存活消息才做负面判定，
+                                     # 否则开局第一条 original 就会把整群判成超阈
+
+  # ② 事件发起 —— 流程图「事件源 → 随机发到小群 / 大群」
+  inject_initial_event: true
+  initial_event_group_scope: "small_or_large"  # small | large | small_or_large | any
+                                     # 小群={DORM,CLASS}  大群={MAJOR,CAMPUS}
+  initial_event_heat: 0.80           # H₀
+  initial_event_negative: 0.72
+  initial_event_content: "校园事件相关消息开始在群聊中传播"
+  secondary_event_probability: 0.05  # 每 tick 追加「后续爆料」的概率，0 = 只投一次
+  secondary_event_max: 2
+  secondary_event_min_interval: 8
+
+  # ③ 跨群条件 —— 流程图「转发次数 ≥ 阈 → 进入跨群通道」
+  cross_group_forward_threshold: 2   # 总开关，≤0 表示完全关闭门槛
+  cross_group_forward_threshold_by_direction:
+    upward:   1                      # 小→大：至少被转过 1 次才能往更大的群捅
+    lateral:  0                      # 小群互转：熟人圈层顺手一转，无门槛
+    downward: 3                      # 大→小倒灌最难
+  cross_group_heat_bypass: true      # 源群热度 ≥ θ 时可绕过门槛（对应「热度高→进其他群」）
+  macro_spread_requires_threshold: true
+
+  # ④ 转发方向权重 —— 流程图 DORM–CLASS 横向箭头
+  allow_downward_forward: true
+  forward_direction_weights:
+    upward:   1.00                   # 主通道
+    lateral:  0.55                   # 小群互转（弱）
+    downward: 0.15                   # 大群→小群（最弱）
+  intra_group_forward_weight: 0.60   # 群内转发，是攒够转发次数的唯一途径
+  forward_exposure_weight: 0.50      # 选目标群时曝光的影响力度
+
+  # ⑤ 禁言 / 公告 ——《场景设定》§2 Controller「提醒、澄清、禁言、公告」
+  enable_mute: true
+  mute_duration_ticks: 3             # 实际时长再乘 control_level/2，管理强的群禁得久
+  mute_negative_trigger: 0.68
+  mute_max_per_tick: 2
+  governance_cooldown_ticks: 3       # 同一 Controller 对同一群的治理动作最小间隔
+  announce_negative_relief: 0.18
+  announce_distortion_relief: 0.30
+
+  # ⑥ 曝光 ——《场景设定》§1 群类型表「曝光」列（DORM 低 → CAMPUS 高）
+  exposure_heat_weight: 0.60         # 曝光对热度增益的影响
+  exposure_spread_weight: 1.00       # 曝光对宏观跨群溅射目标选择的影响
+  exposure_perception_weight: 0.60   # 曝光对单 tick 注意力配额的影响
+
+  # 传播失真 / 干预后恢复 ——《场景设定》§3
+  forward_distortion_probability: 0.70
+  forward_distortion_increment_min: 0.03
+  forward_distortion_increment_max: 0.15
+  intervention_negative_decay: 0.75
+  intervention_distortion_decay: 0.80
+
+  # 热度标度（保证 θ=0.7 有阈值语义，H 不会被消息量线性顶穿）
+  base_heat_gain: 0.038
+  heat_cap: 3.0
+  message_expire_ticks: 10
+  negative_smoothing: 0.50
+
 llm_config: {}
 
-random_seed: null   # null = 每次随机种子
+random_seed: 42     # A 模块自测用固定种子，保证可复现；做实验时改成 null

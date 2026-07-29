@@ -2,30 +2,27 @@
 social_agent.py — 智能体层（接口表 #1–11）
 -----------------------------------------
 负责人：B
-本文件为 A 在 W4 阶段使用的「规则存根」，接口已对齐接口表 v2：
-  - AgentType: ORDINARY/ACTIVE/RATIONAL/CONTROLLER
-  - GroupType: DORM/CLASS/MAJOR/CAMPUS
-  - ActionType: SEND_MESSAGE/REPLY/FORWARD/SILENT（移除 LIKE）
-  - MessageType: ORIGINAL/FORWARD/PARAPHRASE/EXAGGERATE/CLARIFICATION
-  - 所有 event_id → topic_id
-  - ActionRecord / SocialInfo / Perception / Desire / Intention 均使用 v2 字段
-  - __init__ 新增 group_type 参数（A 模块实例化时传入）
-  - 新增 calc_heat_decay (#11，A 模块在 _update_environment 中调用)
+本文件是 A 在 W4/W5 阶段使用的「规则存根」，接口已对齐接口表 v3。
 
-【W4 LLM 接入变更】
-  - _update_beliefs 改为双路径：优先走 LLM（C 模块），失败时自动降级规则存根
-  - LLM 路径：从 self.model._llm_client 取客户端，调用 C 模块
-    build_prompt / chat / parse_llm_response，将返回的
-    opinion_updates 和 emotion_delta 写入 self.beliefs
-  - 降级路径：原 Deffuant-Weisbuch 有界置信度规则，逻辑不变
-  - _llm_client 为 None（config.llm_config 为空）时仅走规则存根
+【v3 变更（A 模块为对齐《场景设定》而改动的部分，B 接手时请保留语义）】
+  ⑤ 禁言：CONTROLLER 新增 mute / announce 两种欲望与意图，
+     真正提交 ActionType.MUTE / ActionType.ANNOUNCE 给环境层执行；
+     被禁言的 Agent 在该群内不再生成任何行动。
+  ③④ 转发：
+     - 新增群内转发（intra），是攒够 forward_count、打开跨群通道的唯一途径；
+     - 转发目标由 model.select_forward_destination(..., forward_count=...) 决定，
+       方向权重 upward / lateral(小群互转) / downward 由 A 模块配置。
+  ⑥ 曝光：Perception 新增 exposure / group_exposure，转发意愿与曝光正相关。
+  ⑦ 降温：calc_heat_decay 改写为「基础降温 × control_level」形式，
+     与 types_def.heat_decay 数值完全一致。
+  ⑧ 人格：新增 trust（信任度）与 confirmation_bias（确认偏误），
+     不再把它们混在人格五因素 + stance 里：
+       - trust 低      → 折价高 distortion 消息，转发意愿下降；
+       - bias 高       → 只吸收与自身立场同向的信息，放大极化。
 
-【转发行为修复】
-  - 所有角色按差异化概率生成 share，不再只允许 ACTIVE 转发
-  - share 必须绑定真实 source_message_id/source_group_id 与 destination_group_id
-  - target_id 仅保留源消息作者语义，不再承担群路由
-  - LLM 返回的 action_type/target/消息与群路由直接转换为 Intention 并优先执行
-  - 转发在目标群创建新 ActionRecord，供目标群成员下一 tick 感知
+【W4 LLM 接入】
+  - _update_beliefs 双路径：优先走 LLM（C 模块），失败自动降级规则存根；
+  - LLM 返回的 action_type / target / 群路由直接转成 Intention 并优先执行。
 
 真实 LLM 与规则降级共用同一套 Intention/ActionRecord 路由校验。
 """
@@ -47,10 +44,12 @@ except ImportError:
 
 from types_def import (
     ActionRecord, ActionType, AgentType, GroupType, MessageType,
-    BeliefSystem, Desire, EmotionState,
+    BeliefSystem, Desire, EmotionState, ForwardDirection,
     IdentityBelief, Intention, MemoryRecord, OpinionBelief, Perception,
     PsychologyBelief, Personality, SocialInfo,
-    ALPHA, THETA, GROUP_BETA,
+    ALPHA, THETA, NEGATIVE_THETA,
+    GROUP_BETA, GROUP_CONTROL_LEVEL, GROUP_EXPOSURE,
+    heat_decay as _formula_heat_decay,
 )
 
 _LOG = logging.getLogger("SocialAgent")
@@ -83,6 +82,29 @@ _SHARE_PRIORITY: Dict[AgentType, float] = {
     AgentType.ACTIVE:     0.75,
     AgentType.RATIONAL:   0.60,
     AgentType.CONTROLLER: 0.50,
+}
+
+# v3：群内转发概率（问题③）。群内接力是「攒够 forward_count → 打开跨群通道」
+# 的唯一途径，因此单独给一套更高的概率；ACTIVE 依旧最积极。
+_INTRA_SHARE_PROBABILITY: Dict[AgentType, float] = {
+    AgentType.ORDINARY:   0.12,
+    AgentType.ACTIVE:     0.45,
+    AgentType.RATIONAL:   0.15,
+    AgentType.CONTROLLER: 0.04,
+}
+
+# v3：各角色的信任度 / 确认偏误取值区间（问题⑧）
+_TRUST_RANGE: Dict[AgentType, tuple] = {
+    AgentType.ORDINARY:   (0.45, 0.85),   # 普通群员最容易轻信
+    AgentType.ACTIVE:     (0.40, 0.80),
+    AgentType.RATIONAL:   (0.10, 0.40),   # 理性讨论者天然低信任、爱查证
+    AgentType.CONTROLLER: (0.30, 0.60),
+}
+_BIAS_RANGE: Dict[AgentType, tuple] = {
+    AgentType.ORDINARY:   (0.30, 0.70),
+    AgentType.ACTIVE:     (0.40, 0.85),   # 活跃者更容易只看同温层
+    AgentType.RATIONAL:   (0.05, 0.30),   # 理性讨论者确认偏误最低
+    AgentType.CONTROLLER: (0.20, 0.50),
 }
 
 _MEMORY_CAPACITY = 20   # 短期记忆最大条数
@@ -134,8 +156,11 @@ class SocialAgent(Agent):
             super().__init__(model)
         self.unique_id = unique_id
 
-        # βₖ（由 group_type 决定，B 模块内部读取 GROUP_BETA）
+        # βₖ 与 control_level（问题⑦：二者由 α 联系，β_k = α·(control_level_k − 1)）
         self.beta: float = GROUP_BETA[group_type]
+        self.control_level: float = GROUP_CONTROL_LEVEL[group_type]
+        # 主群曝光度（问题⑥，《场景设定》§1 群类型表）
+        self.exposure: float = GROUP_EXPOSURE[group_type]
 
         # intervention_tick：A 模块为权威，此处仅供参考记录
         self.intervention_tick: Optional[int] = None
@@ -176,6 +201,11 @@ class SocialAgent(Agent):
             },
         )
 
+        # v3：Controller 已在哪些群公告过（用于「先公告、后禁言」的升级阶梯）
+        self._announced_groups: set = set()
+        # v3：对每个群最近一次治理动作的 tick（冷却期）
+        self._last_governance_tick: Dict[str, int] = {}
+
         self.memory: deque = deque(maxlen=_MEMORY_CAPACITY)
         self.pending_action: Optional[ActionRecord] = None
         self._last_perception: Optional[Perception] = None
@@ -187,8 +217,20 @@ class SocialAgent(Agent):
     #  #2  _init_psychology                                                #
     # ------------------------------------------------------------------ #
     def _init_psychology(self) -> None:
-        """生成五因素人格 + 风险规避系数，写入 self.beliefs.psychology。"""
+        """
+        生成五因素人格 + 风险规避系数 + 【v3】信任度 / 确认偏误。
+
+        问题⑧：trust 与 confirmation_bias 过去被隐含在「人格 + stance」里，
+        现在单独建模，并按角色给出不同取值区间：
+          RATIONAL   低 trust、低 bias  → 质疑来源、愿意接受反向证据
+          ACTIVE     中 trust、高 bias  → 转得多，但只转同温层
+          ORDINARY   高 trust、中 bias  → 容易被高失真消息带走
+          CONTROLLER 中 trust、中低 bias
+        """
         rng = self.model.random
+        agent_type = self.beliefs.identity.agent_type
+        trust_lo, trust_hi = _TRUST_RANGE[agent_type]
+        bias_lo, bias_hi = _BIAS_RANGE[agent_type]
         self.beliefs.psychology = PsychologyBelief(
             personality=Personality(
                 openness=rng.uniform(0.2, 0.8),
@@ -198,6 +240,8 @@ class SocialAgent(Agent):
                 neuroticism=rng.uniform(0.1, 0.7),
             ),
             risk_aversion=rng.uniform(0.1, 0.9),
+            trust=rng.uniform(trust_lo, trust_hi),
+            confirmation_bias=rng.uniform(bias_lo, bias_hi),
         )
         stance = self.beliefs.identity.stance_prior
         neur   = self.beliefs.psychology.personality.neuroticism
@@ -228,6 +272,12 @@ class SocialAgent(Agent):
             self._update_beliefs(perception, memories)
         except Exception as e:
             _LOG.debug(f"Agent-{self.unique_id} _update_beliefs 异常: {e}")
+
+        try:
+            # 环境情绪传染：与 LLM / 规则两条信念路径都正交，始终执行。
+            self._absorb_emotional_contagion(perception)
+        except Exception as e:
+            _LOG.debug(f"Agent-{self.unique_id} 情绪传染异常: {e}")
 
         try:
             if (
@@ -285,6 +335,8 @@ class SocialAgent(Agent):
                 group_id=record.group_id,
                 source_message_id=record.source_message_id,
                 source_group_id=record.source_group_id,
+                forward_count=record.forward_count,
+                root_message_id=record.root_message_id,
             )
             recent_messages.append(si)
             if si.is_mention:
@@ -300,6 +352,11 @@ class SocialAgent(Agent):
             group_ids=group_ids,
             group_type=group_type,
             beta=beta,
+            control_level=self.control_level,
+            exposure=self.exposure,
+            group_exposure={
+                gid: self.model.get_group_exposure(gid) for gid in group_ids
+            },
             recent_messages=recent_messages,
             mentions=mentions,
             tick=tick,
@@ -307,6 +364,8 @@ class SocialAgent(Agent):
             topic_negative=topic_negative,
             topic_heat_by_group=topic_heat_by_group,
             topic_negative_by_group=topic_negative_by_group,
+            intervened_groups=self.model.get_intervened_groups(self.unique_id),
+            muted_groups=self.model.get_muted_groups(self.unique_id),
         )
         self._last_perception = perception
         return perception
@@ -453,8 +512,16 @@ class SocialAgent(Agent):
         #  LLM 不可用 / 调用失败 / llm_config 为空时执行此路径            #
         # ══════════════════════════════════════════════════════════════ #
         agent_type = self.beliefs.identity.agent_type
-        eps = _CONFIDENCE_BOUND[agent_type]
-        mu  = _LEARNING_RATE[agent_type]
+        psychology = self.beliefs.psychology
+        trust = float(np.clip(psychology.trust, 0.0, 1.0))
+        bias = float(np.clip(psychology.confirmation_bias, 0.0, 1.0))
+
+        # 【问题⑧】信任度与确认偏误单独参与推理：
+        #   - 置信区间 eps 随 trust 放大（信任的人接纳更宽的观点区间）；
+        #   - 学习率 mu 随 trust 放大、随 bias 缩小（偏见强 → 几乎不被说服）。
+        eps = float(np.clip(_CONFIDENCE_BOUND[agent_type] * (0.6 + 0.8 * trust), 0.05, 1.5))
+        mu = float(np.clip(_LEARNING_RATE[agent_type] * (0.5 + trust) * (1.0 - 0.7 * bias),
+                           0.0, 1.0))
 
         topic_id = self._get_primary_topic_id()
         if topic_id not in self.beliefs.opinions:
@@ -462,23 +529,38 @@ class SocialAgent(Agent):
 
         current_op = self.beliefs.opinions[topic_id].opinion_value
 
-        # RATIONAL 角色：对高 distortion_level 消息打折
         def _effective_opinion(si: SocialInfo) -> float:
+            """把一条消息折算成「它在表达什么立场」。"""
+            if si.message_type == MessageType.CLARIFICATION:
+                # 澄清 / 公告：把观点往中性拉
+                return 0.0
+            raw = -si.negative_score if si.negative_score > 0.6 else 0.0
             if agent_type == AgentType.RATIONAL and si.distortion_level > 0.5:
-                return si.negative_score * -1.0  # 质疑负面内容
-            # 用 negative_score 辅助估算邻居倾向（负面→负面立场）
-            return -si.negative_score if si.negative_score > 0.6 else 0.0
+                raw = si.negative_score * -1.0      # 质疑高失真的负面内容
+            # 低信任者对高失真消息整体打折（trust 越低折得越狠）
+            credibility = 1.0 - si.distortion_level * (1.0 - trust)
+            return raw * float(np.clip(credibility, 0.0, 1.0))
 
         # 从 recent_messages 取同话题消息的有效观点
-        neighbor_ops = []
+        neighbor_ops: List[float] = []
+        weights: List[float] = []
         for si in perception.recent_messages:
-            if si.topic_id == topic_id:
-                if abs(_effective_opinion(si) - current_op) < eps:
-                    neighbor_ops.append(_effective_opinion(si))
+            if si.topic_id != topic_id:
+                continue
+            value = _effective_opinion(si)
+            if abs(value - current_op) >= eps:
+                continue
+            # 确认偏误：与自身立场同向的信息权重更高，反向的被压低
+            aligned = 1.0 if value * current_op >= 0 else -1.0
+            weight = 1.0 + bias * aligned
+            if weight <= 0.0:
+                continue
+            neighbor_ops.append(value)
+            weights.append(weight)
 
         if neighbor_ops:
-            target  = float(np.mean(neighbor_ops))
-            new_op  = float(np.clip(current_op + mu * (target - current_op), -1.0, 1.0))
+            target = float(np.average(neighbor_ops, weights=weights))
+            new_op = float(np.clip(current_op + mu * (target - current_op), -1.0, 1.0))
             consistency = (1.0 - float(np.std(neighbor_ops))
                            if len(neighbor_ops) > 1 else 0.5)
             new_conf = float(np.clip(
@@ -497,54 +579,165 @@ class SocialAgent(Agent):
             ))
 
     # ------------------------------------------------------------------ #
+    #  情绪传染（v3 新增，支撑 negative_emotion / emotional_contagion 指标）
+    # ------------------------------------------------------------------ #
+    def _absorb_emotional_contagion(self, perception: Perception) -> None:
+        """
+        把「群里正在流传什么」转化为个体情绪。
+
+        没有这一步，agent 情绪只会向基线回归，群负面程度永远停在 0.5 附近，
+        《场景设定》「负面程度超过阈值 → controller 干预」就永远触发不了。
+
+        易感度由人格与信任度共同决定（问题⑧）：
+            神经质高 → 更容易被带动；
+            信任度高 → 更容易照单全收；
+            失真高的消息对低信任者影响被打折。
+        """
+        messages = perception.recent_messages
+        if not messages:
+            return
+
+        psychology = self.beliefs.psychology
+        trust = float(np.clip(psychology.trust, 0.0, 1.0))
+        neuroticism = float(np.clip(psychology.personality.neuroticism, 0.0, 1.0))
+
+        w_sum = 0.0
+        neg_sum = 0.0
+        for si in messages:
+            credibility = float(np.clip(1.0 - si.distortion_level * (1.0 - trust), 0.05, 1.0))
+            weight = credibility * (1.0 + float(np.clip(si.heat, 0.0, 2.0)))
+            if si.message_type == MessageType.CLARIFICATION:
+                weight *= 1.5          # 澄清 / 公告的降温作用更明显
+            w_sum += weight
+            neg_sum += weight * float(np.clip(si.negative_score, 0.0, 1.0))
+        if w_sum <= 1e-12:
+            return
+
+        perceived_negative = neg_sum / w_sum
+        target_valence = 1.0 - 2.0 * perceived_negative          # neg=1 → -1, neg=0 → +1
+        susceptibility = 0.10 + 0.20 * neuroticism + 0.10 * trust
+
+        emotion = self.beliefs.emotion
+        delta_valence = susceptibility * (target_valence - emotion.valence)
+        if delta_valence < 0:
+            delta_valence *= 1.20   # 负性偏向：坏消息比好消息更"传得动"
+        emotion.valence = float(np.clip(emotion.valence + delta_valence, -1.0, 1.0))
+        target_arousal = float(np.clip(0.35 + 0.65 * perceived_negative, 0.0, 1.0))
+        emotion.arousal = float(np.clip(
+            emotion.arousal + susceptibility * (target_arousal - emotion.arousal), 0.0, 1.0))
+
+    # ------------------------------------------------------------------ #
     #  #7  _infer_desires                                                  #
     # ------------------------------------------------------------------ #
     def _infer_desires(self) -> List[Desire]:
         """
         基于信念与多群感知生成欲望。
 
-        share/reply/clarify 都绑定真实消息与真实群；share 还必须给出另一个
-        Agent 已加入的 ``destination_group_id``，因此不会再生成 target=None
-        或“只改计数、不投递消息”的伪跨群转发。
+        v3 关键改动：
+          ⑤ CONTROLLER 在已触发干预的群里会真正生成 mute / announce 欲望，
+            而不是只发一条澄清；
+          ③ 转发欲望分成「群内接力（intra）」与「跨群（cross）」两条，
+            跨群通道只有在源消息转发次数达阈时才由 A 模块开放；
+          ⑥ 转发意愿与目标群曝光正相关；
+          ⑧ 低 trust 的 agent 不愿意转发高失真消息。
         """
         emotion = self.beliefs.emotion
+        psychology = self.beliefs.psychology
         agent_type = self.beliefs.identity.agent_type
         topic_id = self._get_primary_topic_id()
         primary_group_id = self._get_primary_group_id()
+        perception = self._last_perception
         desires: List[Desire] = []
 
+        muted_groups = set(perception.muted_groups) if perception else set()
+        negative_threshold = float(getattr(self.model, "negative_threshold", NEGATIVE_THETA))
+        heat_threshold = float(getattr(self.model, "heat_threshold", THETA))
+
+        # ── 找出「风险最高」的群：热度或负面任一更突出 ────────────────
         hottest_group_id = primary_group_id
         hottest_heat = 0.0
-        if self._last_perception is not None:
-            for group_id, topic_map in self._last_perception.topic_heat_by_group.items():
+        hottest_negative = 0.0
+        if perception is not None:
+            best_score = -1.0
+            for group_id, topic_map in perception.topic_heat_by_group.items():
+                if group_id in muted_groups:
+                    continue
                 heat = float(topic_map.get(topic_id, 0.0))
-                if heat > hottest_heat:
+                negative = float(
+                    perception.topic_negative_by_group.get(group_id, {}).get(topic_id, 0.0)
+                )
+                score = max(heat / max(heat_threshold, 1e-9),
+                            negative / max(negative_threshold, 1e-9))
+                if score > best_score:
+                    best_score = score
                     hottest_heat = heat
+                    hottest_negative = negative
                     hottest_group_id = group_id
 
-        # CONTROLLER 在自己加入的非 DORM 群中，对真正达到阈值的群执行干预。
         hottest_type = self.model.get_group_type_by_id(hottest_group_id)
-        if (
-            agent_type == AgentType.CONTROLLER
-            and hottest_type is not None
-            and hottest_type != GroupType.DORM
-            and hottest_heat >= THETA
-        ):
-            desires.append(Desire(
-                "intervene",
-                priority=0.9,
-                topic_id=topic_id,
-                destination_group_id=hottest_group_id,
-            ))
+        trigger_mode = getattr(self.model, "intervention_trigger", "negative")
+        heat_hit = hottest_heat >= heat_threshold
+        negative_hit = hottest_negative >= negative_threshold
+        if trigger_mode == "heat":
+            trigger_hit = heat_hit
+        elif trigger_mode == "negative":
+            trigger_hit = negative_hit
+        elif trigger_mode == "heat_and_negative":
+            trigger_hit = heat_hit and negative_hit
+        else:
+            trigger_hit = heat_hit or negative_hit
 
-        # RATIONAL 对一条具体高失真消息在其所在群内澄清。
-        if agent_type == AgentType.RATIONAL and self._last_perception:
+        # ── CONTROLLER：提醒 / 澄清 / 禁言 / 公告（问题⑤）─────────────
+        #    只要该群仍处于「已触发干预」状态就持续治理（一次公告压不住是常态），
+        #    但对同一个群有冷却期，避免 10 个 Controller 每 tick 刷屏。
+        flagged = bool(perception and hottest_group_id in perception.intervened_groups)
+        cooldown = int(getattr(self.model, "governance_cooldown_ticks", 3))
+        tick_now = perception.tick if perception else 0
+        cooled = (tick_now - self._last_governance_tick.get(hottest_group_id, -10 ** 9)) >= cooldown
+
+        if (agent_type == AgentType.CONTROLLER
+                and hottest_type is not None
+                and hottest_type != GroupType.DORM        # DORM 群介入不了
+                and hottest_group_id not in muted_groups
+                and flagged            # 以 A 模块的 intervention_tick 为唯一权威
+                and cooled):
+
+            worst = self._select_mute_target(hottest_group_id)
+            mute_enabled = bool(getattr(self.model, "enable_mute", True))
+            mute_trigger = float(getattr(self.model, "mute_negative_trigger", 0.68))
+            already_announced = hottest_group_id in self._announced_groups
+
+            # 升级阶梯（《场景设定》§2「提醒、澄清、禁言、公告」）：
+            #   第一次触发 → 公告 / 澄清；
+            #   已经公告过但负面仍未压下去 → 禁言最恶劣的传播者。
+            if mute_enabled and worst is not None and already_announced:
+                desires.append(Desire(
+                    "mute",
+                    priority=0.98,
+                    topic_id=topic_id,
+                    target_id=worst.source_id,
+                    source_message_id=worst.message_id,
+                    source_group_id=worst.group_id,
+                    destination_group_id=hottest_group_id,
+                ))
+            else:
+                desires.append(Desire(
+                    "announce" if hottest_negative >= negative_threshold else "intervene",
+                    priority=0.92,
+                    topic_id=topic_id,
+                    destination_group_id=hottest_group_id,
+                ))
+
+        # ── RATIONAL：针对一条具体高失真消息澄清（低 trust 更敏感）────
+        if agent_type == AgentType.RATIONAL and perception is not None:
             distorted = max(
-                self._last_perception.recent_messages,
+                (si for si in perception.recent_messages
+                 if si.group_id not in muted_groups),
                 key=lambda si: si.distortion_level,
                 default=None,
             )
-            if distorted is not None and distorted.distortion_level > 0.5:
+            scrutiny_threshold = 0.30 + 0.40 * float(np.clip(psychology.trust, 0.0, 1.0))
+            if distorted is not None and distorted.distortion_level > scrutiny_threshold:
                 desires.append(Desire(
                     "clarify",
                     priority=0.75,
@@ -555,7 +748,7 @@ class SocialAgent(Agent):
                     destination_group_id=distorted.group_id,
                 ))
 
-        if emotion.arousal > 0.65 and emotion.valence < -0.2:
+        if emotion.arousal > 0.65 and emotion.valence < -0.2 and hottest_group_id not in muted_groups:
             desires.append(Desire(
                 "discuss",
                 priority=0.7,
@@ -563,42 +756,66 @@ class SocialAgent(Agent):
                 destination_group_id=hottest_group_id,
             ))
 
-        # 真实跨群转发：源消息来自当前可见流，目标群是发送者的另一成员群。
+        # ── 转发（问题③④⑥⑧）────────────────────────────────────────
         forward_source = self._select_forward_source()
         if forward_source is not None:
             destination_group_id = self.model.select_forward_destination(
                 self.unique_id,
                 forward_source.group_id,
+                forward_count=forward_source.forward_count,
             )
-            share_priority: Optional[float] = None
-            if destination_group_id is not None:
-                if self.model.random.random() < _SHARE_PROBABILITY[agent_type]:
+            if destination_group_id is not None and destination_group_id not in muted_groups:
+                source_type = self.model.get_group_type_by_id(forward_source.group_id)
+                dest_type = self.model.get_group_type_by_id(destination_group_id)
+                is_intra = (source_type == dest_type)
+
+                base_p = (_INTRA_SHARE_PROBABILITY[agent_type] if is_intra
+                          else _SHARE_PROBABILITY[agent_type])
+                # ⑥ 曝光：目标群曝光越高，越值得转过去
+                exposure = self.model.get_group_exposure(destination_group_id)
+                base_p *= (0.55 + 0.45 * exposure)
+                # ⑧ 信任：低信任者不愿意扩散高失真消息
+                trust = float(np.clip(psychology.trust, 0.0, 1.0))
+                base_p *= float(np.clip(1.0 - forward_source.distortion_level * (1.0 - trust),
+                                        0.05, 1.0))
+
+                share_priority: Optional[float] = None
+                if self.model.random.random() < base_p:
                     share_priority = _SHARE_PRIORITY[agent_type]
                 if emotion.arousal > 0.65 and emotion.valence >= -0.2:
                     share_priority = max(share_priority or 0.0, 0.65)
 
-            if share_priority is not None and destination_group_id is not None:
-                desires.append(Desire(
-                    "share",
-                    priority=share_priority,
-                    topic_id=forward_source.topic_id or topic_id,
-                    target_id=forward_source.source_id,
-                    source_message_id=forward_source.message_id,
-                    source_group_id=forward_source.group_id,
-                    destination_group_id=destination_group_id,
-                ))
+                if share_priority is not None:
+                    desires.append(Desire(
+                        "share",
+                        priority=share_priority * (0.85 if is_intra else 1.0),
+                        topic_id=forward_source.topic_id or topic_id,
+                        target_id=forward_source.source_id,
+                        source_message_id=forward_source.message_id,
+                        source_group_id=forward_source.group_id,
+                        destination_group_id=destination_group_id,
+                    ))
 
-        # 回复也绑定具体消息，并留在消息所在群。
+        # ── 兜底：讨论 / 回复 ────────────────────────────────────────
+        fallback_group_id = primary_group_id
+        if fallback_group_id in muted_groups:
+            available = [gid for gid in (perception.group_ids if perception else [])
+                         if gid not in muted_groups]
+            fallback_group_id = available[0] if available else ""
+        if fallback_group_id:
+            desires.append(Desire(
+                "discuss",
+                priority=0.35,
+                topic_id=topic_id,
+                destination_group_id=fallback_group_id,
+            ))
+
         reply_source = None
-        if self._last_perception and self._last_perception.recent_messages:
-            reply_source = self._last_perception.recent_messages[0]
-
-        desires.append(Desire(
-            "discuss",
-            priority=0.35,
-            topic_id=topic_id,
-            destination_group_id=primary_group_id,
-        ))
+        if perception is not None:
+            reply_source = next(
+                (si for si in perception.recent_messages if si.group_id not in muted_groups),
+                None,
+            )
         if reply_source is not None:
             desires.append(Desire(
                 "reply",
@@ -612,6 +829,27 @@ class SocialAgent(Agent):
 
         desires.sort(key=lambda desire: desire.priority, reverse=True)
         return desires
+
+    def _select_mute_target(self, group_id: str) -> Optional[SocialInfo]:
+        """
+        挑选禁言对象（问题⑤）：该群中「失真 × 负面」最高、且不是 Controller
+        自己的消息作者。返回该消息，None 表示没有值得禁言的对象。
+        """
+        if self._last_perception is None:
+            return None
+        candidates = [
+            si for si in self._last_perception.recent_messages
+            if si.group_id == group_id
+            and si.source_id != self.unique_id
+            and si.message_type != MessageType.CLARIFICATION
+        ]
+        if not candidates:
+            return None
+        worst = max(candidates,
+                    key=lambda si: si.distortion_level * 0.5 + si.negative_score * 0.5)
+        if worst.distortion_level * 0.5 + worst.negative_score * 0.5 < 0.35:
+            return None
+        return worst
 
     # ------------------------------------------------------------------ #
     #  #8  _plan_intentions                                                #
@@ -631,7 +869,9 @@ class SocialAgent(Agent):
         risk_aversion = self.beliefs.psychology.risk_aversion
 
         p_act = extraversion * arousal * (1.0 - risk_aversion * 0.5)
-        if self.model.random.random() > p_act:
+        # 治理动作（禁言 / 公告 / 干预澄清）是职责，不受外向性与唤醒度的概率门限约束
+        is_governance = primary.goal_type in {"mute", "announce", "intervene"}
+        if not is_governance and self.model.random.random() > p_act:
             return Intention(
                 action_type=ActionType.SILENT,
                 topic_id=primary.topic_id,
@@ -645,7 +885,9 @@ class SocialAgent(Agent):
             "discuss": ActionType.SEND_MESSAGE,
             "share": ActionType.FORWARD,
             "clarify": ActionType.SEND_MESSAGE,
-            "intervene": ActionType.SEND_MESSAGE,
+            "intervene": ActionType.ANNOUNCE,       # 提醒 / 澄清（走公告通道）
+            "mute": ActionType.MUTE,                # v3 禁言
+            "announce": ActionType.ANNOUNCE,        # v3 公告
         }
         action_type = action_map.get(primary.goal_type, ActionType.SILENT)
         destination_group_id = (
@@ -663,6 +905,34 @@ class SocialAgent(Agent):
         role = self.beliefs.identity.agent_type.name
 
         source_info = self._find_perceived_message(primary.source_message_id)
+        if action_type == ActionType.MUTE:
+            content = (
+                f"[{group_label}/管理员] {self.beliefs.identity.nickname} 已对 "
+                f"Agent-{primary.target_id} 执行禁言，并提醒群内理性发言、勿传未经证实信息"
+            )
+            return Intention(
+                action_type=ActionType.MUTE,
+                content_plan=content,
+                topic_id=primary.topic_id,
+                target_id=primary.target_id,
+                source_message_id=primary.source_message_id,
+                source_group_id=primary.source_group_id,
+                destination_group_id=destination_group_id,
+                message_type=MessageType.CLARIFICATION,
+                mute_duration=int(getattr(self.model, "mute_duration_ticks", 3)),
+            )
+        if action_type == ActionType.ANNOUNCE:
+            content = (
+                f"[{group_label}/管理员] {self.beliefs.identity.nickname} 发布公告："
+                f"关于{primary.topic_id}的情况正在核实，请以官方通报为准，勿信勿传"
+            )
+            return Intention(
+                action_type=ActionType.ANNOUNCE,
+                content_plan=content,
+                topic_id=primary.topic_id,
+                destination_group_id=destination_group_id,
+                message_type=MessageType.CLARIFICATION,
+            )
         if action_type == ActionType.FORWARD:
             source_label = (
                 source_info.source_nickname
@@ -725,7 +995,43 @@ class SocialAgent(Agent):
             )
             return {}
 
+        # 【问题⑤】被禁言者在该群内无法发声
+        if self.model.is_muted(self.unique_id, destination_group_id):
+            _LOG.debug("Agent-%s 在 %s 被禁言，本轮沉默", self.unique_id, destination_group_id)
+            return {}
+
         opinion_value = self._get_primary_opinion_value()
+
+        # 【问题⑤】治理动作走专用分支：不产生热度，直接交环境层执行
+        if intention.action_type in (ActionType.MUTE, ActionType.ANNOUNCE):
+            record = ActionRecord(
+                agent_id=self.unique_id,
+                action_type=intention.action_type,
+                content=intention.content_plan,
+                target_id=intention.target_id,
+                tick=tick,
+                topic_id=intention.topic_id,
+                distortion_level=0.0,
+                message_type=MessageType.CLARIFICATION,
+                negative_score=0.0,
+                heat=0.0,
+                group_id=destination_group_id,
+                mute_duration=int(getattr(intention, "mute_duration", 0)),
+            )
+            if not self.model.submit_action(record):
+                return {}
+            self.pending_action = record
+            self._last_governance_tick[destination_group_id] = tick
+            self._announced_groups.add(destination_group_id)
+            if self.intervention_tick is None:
+                self.intervention_tick = tick
+            return {
+                "submitted": 1.0,
+                "opinion_value": opinion_value,
+                "negative_score": 0.0,
+                "heat": 0.0,
+                "governance": 1.0,
+            }
 
         requested_message_type = str(getattr(intention, "message_type", "") or "").lower()
         legal_message_types = {
@@ -748,8 +1054,8 @@ class SocialAgent(Agent):
         elif agent_type == AgentType.RATIONAL:
             message_type = MessageType.ORIGINAL
         elif (
-            self.beliefs.emotion.arousal > 0.75
-            and self.beliefs.emotion.valence < -0.3
+            self.beliefs.emotion.arousal > 0.65
+            and self.beliefs.emotion.valence < -0.15
         ):
             message_type = MessageType.EXAGGERATE
         else:
@@ -783,8 +1089,17 @@ class SocialAgent(Agent):
             0.0,
             1.0,
         ))
-        if message_type == MessageType.CLARIFICATION:
-            negative_score = max(0.0, negative_score - 0.3)
+        # 消息语义类型直接影响负面程度（《场景设定》§3 五类消息）：
+        # 夸大 > 转述 > 直接转发 ≈ 原创 > 澄清
+        _NEGATIVE_BY_MESSAGE_TYPE = {
+            MessageType.EXAGGERATE:    +0.18,
+            MessageType.PARAPHRASE:    +0.06,
+            MessageType.FORWARD:       +0.02,
+            MessageType.ORIGINAL:       0.00,
+            MessageType.CLARIFICATION: -0.35,
+        }
+        negative_score = float(np.clip(
+            negative_score + _NEGATIVE_BY_MESSAGE_TYPE.get(message_type, 0.0), 0.0, 1.0))
 
         topic_heat_now = 0.0
         if self._last_perception:
@@ -847,12 +1162,11 @@ class SocialAgent(Agent):
             relevance=1.0,
         ))
 
-        if (
-            agent_type == AgentType.CONTROLLER
-            and destination_group_type != GroupType.DORM
-            and self.intervention_tick is None
-        ):
-            self.intervention_tick = tick
+        if (agent_type == AgentType.CONTROLLER
+                and destination_group_type != GroupType.DORM):
+            pass
+            if self.intervention_tick is None:
+                self.intervention_tick = tick
 
         return {
             "submitted": 1.0,
@@ -901,7 +1215,16 @@ class SocialAgent(Agent):
         """
         热度衰减纯计算函数（无副作用），供 A 模块 _update_environment 调用。
 
-        公式：H_k(t+1) = H_k(t) · e^(-α) · e^(-β_k · 𝟙[t ≥ t_k^int])
+        【问题⑦：两处表述统一】
+        《场景设定》§3 文字版：实际降温 = 基础降温 × control_level (>1)
+        《场景设定》§4.2 公式版：H_k(t+1) = H_k(t)·e^(−α)·e^(−β_k·𝟙[t ≥ t_k^int])
+
+        本实现直接采用文字版形式，并保证与公式版逐位等价：
+
+            未干预：H(t+1) = H(t) · exp(−α)                    （control_level = 1）
+            已干预：H(t+1) = H(t) · exp(−α · control_level_k)
+                          ≡ H(t) · exp(−α) · exp(−β_k)
+            因为 β_k = α · (control_level_k − 1)。
 
         Parameters
         ----------
@@ -914,17 +1237,13 @@ class SocialAgent(Agent):
         float ≥ 0.0
         """
         group_type = self.beliefs.identity.group_type
-        natural_decay = math.exp(-self.ALPHA)
-
-        if group_type == GroupType.DORM:
-            # DORM：t_dorm^int = +∞，干预衰减固定为 1.0
-            intervention_decay = 1.0
-        elif intervention_tick is not None and elapsed_steps >= intervention_tick:
-            intervention_decay = math.exp(-self.beta)
-        else:
-            intervention_decay = 1.0
-
-        return max(0.0, current_heat * natural_decay * intervention_decay)
+        # DORM：t_dorm^int = +∞，永远只有基础降温
+        intervened = (
+            group_type != GroupType.DORM
+            and intervention_tick is not None
+            and elapsed_steps >= intervention_tick
+        )
+        return _formula_heat_decay(current_heat, group_type, intervened)
 
     # ------------------------------------------------------------------ #
     #  内部辅助                                                            #
@@ -934,21 +1253,29 @@ class SocialAgent(Agent):
         if self._last_perception is None:
             return None
 
+        muted = set(self._last_perception.muted_groups)
         candidates = [
             social_info
             for social_info in self._last_perception.recent_messages
             if social_info.source_id != self.unique_id
+            and social_info.message_type != MessageType.CLARIFICATION
             and bool(social_info.content.strip())
             and bool(social_info.message_id)
             and bool(social_info.group_id)
+            and social_info.group_id not in muted
+            # 【问题③】把源消息的转发次数传给 A 模块：未达门槛时只剩群内通道，
+            # 达到门槛后跨群通道才会出现在候选里。
             and bool(self.model.get_forward_destination_candidates(
                 self.unique_id,
                 social_info.group_id,
+                forward_count=social_info.forward_count,
             ))
         ]
         if not candidates:
             return None
-        return self.model.random.choice(candidates[:5])
+        # 在全部可见消息中抽样，而不是只看最新 5 条 —— 否则大群消息量压倒性
+        # 领先，小群消息永远轮不到被转发，小群互转就永远是 0。
+        return self.model.random.choice(candidates)
 
     def _find_perceived_message(self, message_id: Optional[str]) -> Optional[SocialInfo]:
         if not message_id or self._last_perception is None:
@@ -986,8 +1313,16 @@ class SocialAgent(Agent):
             "REPLY": ActionType.REPLY,
             "FORWARD": ActionType.FORWARD,
             "SILENT": ActionType.SILENT,
+            "MUTE": ActionType.MUTE,          # v3：仅 CONTROLLER 合法
+            "ANNOUNCE": ActionType.ANNOUNCE,  # v3：仅 CONTROLLER 合法
         }
         action_type = action_map.get(action_name, ActionType.SILENT)
+        # 越权的治理动作直接降级为普通发言，交由 A 模块最终裁决
+        if (action_type in (ActionType.MUTE, ActionType.ANNOUNCE)
+                and self.beliefs.identity.agent_type != AgentType.CONTROLLER):
+            _LOG.debug("Agent-%s 非 CONTROLLER，LLM 的 %s 动作降级为 SEND_MESSAGE",
+                       self.unique_id, action_name)
+            action_type = ActionType.SEND_MESSAGE
         topic_id = str(result.get("topic_id") or self._get_primary_topic_id())
         primary_group_id = self._get_primary_group_id()
 
@@ -1041,11 +1376,13 @@ class SocialAgent(Agent):
             valid_destinations = self.model.get_forward_destination_candidates(
                 self.unique_id,
                 source_info.group_id,
+                forward_count=source_info.forward_count,
             )
             if destination_group_id not in valid_destinations:
                 destination_group_id = self.model.select_forward_destination(
                     self.unique_id,
                     source_info.group_id,
+                    forward_count=source_info.forward_count,
                 ) or ""
             if not destination_group_id:
                 return None
@@ -1073,6 +1410,13 @@ class SocialAgent(Agent):
                 f"关于{topic_id}的消息"
             )
 
+        mute_duration = 0
+        if action_type == ActionType.MUTE:
+            if target_id is None:
+                _LOG.debug("Agent-%s 丢弃 LLM MUTE：未给出 target_id", self.unique_id)
+                return None
+            mute_duration = int(getattr(self.model, "mute_duration_ticks", 3))
+
         return Intention(
             action_type=action_type,
             content_plan=content,
@@ -1082,6 +1426,7 @@ class SocialAgent(Agent):
             source_group_id=source_group_id,
             destination_group_id=destination_group_id or primary_group_id,
             message_type=str(result.get("message_type") or ""),
+            mute_duration=mute_duration,
         )
 
     def _get_primary_opinion_value(self) -> float:

@@ -431,28 +431,40 @@ if __name__ == "__main__":
         val = f"= {df[col].mean():.3f}" if ok else ""
         print(f"   {'✅' if ok else '❌'}  {col:30s} {val}")
 
-    # ── 独立探针1：验证热度从阈值以下逐步升高后，在中间 tick 触发干预 ──
+    # ── 独立探针1（v3）：负面程度从阈值以下逐步升高，在中间 tick 触发干预 ──
+    #    v3 起默认触发条件是《场景设定》原文的「负面程度超过阈值」，
+    #    因此这里让 negative_score 逐步爬升，而不是堆热度。
+    from types_def import AgentType
     probe = TestOpinionModel(n_agents=20, n_steps=12)
     probe.cross_group_spread_probability = 0.0
+    probe.info_stream_cache = []
+    probe._message_by_id = {}
     for g in GroupType:
         probe.topic_heat["T001"][g] = 0.0
+        probe.topic_negative["T001"][g] = 0.0
     probe.intervention_tick = {g: None for g in GroupType}
     probe._heat_exceeded_tick = None
     probe._recovery_time = None
     class_agent = next(a for a in probe.schedule.agents
                        if a.beliefs.identity.group_type == GroupType.CLASS)
+    # 该群必须有 Controller，否则按设定就没人能干预
+    class_agent.beliefs.identity.agent_type = AgentType.CONTROLLER
     intervention_heat_trace = []
-    for _ in range(12):
+    for i in range(12):
         probe.submit_action(ActionRecord(
             agent_id=class_agent.unique_id,
             action_type=ActionType.SEND_MESSAGE,
-            content="受控升温消息", topic_id="T001",
+            content=f"受控升温消息{i}", topic_id="T001",
             message_type=MessageType.ORIGINAL,
-            distortion_level=0.0, negative_score=0.3, heat=0.18,
+            distortion_level=0.0,
+            negative_score=min(0.98, 0.20 + 0.07 * i),   # 负面逐步爬升
+            heat=0.18,
             tick=int(probe.schedule.time),
+            group_id="GROUP_CLASS",
         ))
+        probe._refresh_group_negative()
         probe._update_environment()
-        intervention_heat_trace.append(probe.topic_heat["T001"][GroupType.CLASS])
+        intervention_heat_trace.append(probe.topic_negative["T001"][GroupType.CLASS])
         probe.schedule.time += 1
         probe.schedule.steps += 1
         if probe.intervention_tick[GroupType.CLASS] is not None:
@@ -476,7 +488,7 @@ if __name__ == "__main__":
     final_summary = decay_model.get_final_summary()
 
     print(f"\n3️⃣  热度与干预验证:")
-    print(f"   受控升温轨迹(CLASS): {[round(v, 3) for v in intervention_heat_trace]}")
+    print(f"   受控升温轨迹(CLASS 群负面程度): {[round(v, 3) for v in intervention_heat_trace]}")
     print(f"   CLASS 渐进触发 tick: {gradual_intervention_tick}")
     gradual_ok = gradual_intervention_tick is not None and gradual_intervention_tick > 0
     print(f"   {'✅' if gradual_ok else '❌'} 干预不是 tick 0 立即触发，而是在升温过程中触发")

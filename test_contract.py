@@ -342,6 +342,13 @@ def _routing_fixture():
         },
         hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
         random_seed=42,
+        scenario_params={
+            # 路由类测试只验证「消息投递到哪个群」，因此关掉事件源与转发次数
+            # 门槛这两个正交机制；它们各自有独立测试。
+            "inject_initial_event": False,
+            "cross_group_forward_threshold": 0,
+            "secondary_event_probability": 0.0,
+        },
     ))
     dorm_agents = [
         agent for agent in model.schedule.agents
@@ -562,12 +569,19 @@ def _test_intervention_applies_same_tick():
         network_params={"m": 1, "cross_group_spread_probability": 0.0},
         hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
         random_seed=42,
+        scenario_params={
+            "intervention_trigger": "heat",     # 本测试专门验证热度触发路径
+            "intervention_min_messages": 0,     # 纯热度触发不需要消息证据
+            "inject_initial_event": False,
+            "secondary_event_probability": 0.0,
+        },
     ))
     model.cross_group_spread_probability = 0.0
 
     controller = list(model.schedule.agents)[0]
     controller.beliefs.identity.agent_type = AgentType.CONTROLLER
     controller.beliefs.identity.group_type = GroupType.CAMPUS
+    controller.beliefs.identity.group_ids = ["GROUP_CAMPUS"]
     controller.beta = GROUP_BETA[GroupType.CAMPUS]
 
     model.topic_heat["T001"] = {g: 0.0 for g in GroupType}
@@ -592,6 +606,11 @@ def _test_macro_spread_separate_from_forward():
         n_agents=4,
         network_params={"m": 1, "cross_group_spread_probability": 1.0},
         hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+        scenario_params={
+            "macro_spread_requires_threshold": False,   # 门槛有独立测试
+            "inject_initial_event": False,
+            "secondary_event_probability": 0.0,
+        },
     ))
     model.topic_heat["T001"] = {g: 0.0 for g in GroupType}
     model.topic_heat["T001"][GroupType.DORM] = 1.0
@@ -636,13 +655,353 @@ def _test_model_place_agents_group_type():
             f"Agent-{agent.unique_id} 分层成员关系错误: {identity.group_ids}"
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════ #
+# [A · v3] 场景一致性测试：逐条对应《场景设定》与流程图的 8 个问题
+# ═══════════════════════════════════════════════════════════════════ #
+
+def _v3_model(n=30, **scenario):
+    from types_def import SimConfig
+    from opinion_model import OpinionModel
+    base = {"inject_initial_event": False, "secondary_event_probability": 0.0}
+    base.update(scenario)
+    return OpinionModel(SimConfig(
+        n_agents=n,
+        network_params={"m": 2, "cross_group_spread_probability": 0.0},
+        hawkes_params={"mu": 0.5, "alpha": 0.3, "beta": 1.0},
+        random_seed=42,
+        scenario_params=base,
+    ))
+
+
+def _test_v3_negative_triggers_without_heat():
+    """问题①：负面程度超阈必须触发干预，即使热度远低于 θ。"""
+    from types_def import ActionRecord, ActionType, AgentType, GroupType, MessageType
+
+    model = _v3_model(intervention_trigger="negative", intervention_min_messages=1)
+    campus = [a for a in model.schedule.agents
+              if "GROUP_CAMPUS" in a.beliefs.identity.group_ids]
+    assert campus, "夹具里应存在校园群成员"
+    campus[0].beliefs.identity.agent_type = AgentType.CONTROLLER
+
+    for i in range(4):
+        assert model.submit_action(ActionRecord(
+            agent_id=campus[i % len(campus)].unique_id,
+            action_type=ActionType.SEND_MESSAGE,
+            content=f"高负面消息{i}",
+            tick=0, topic_id="T001", message_type=MessageType.ORIGINAL,
+            negative_score=0.95, heat=0.0, group_id="GROUP_CAMPUS",
+        ))
+    # 群负面用了 EMA 平滑（negative_smoothing=0.5），需要走满几个 tick 才收敛
+    for _ in range(3):
+        model._refresh_group_negative()
+    model._evaluate_intervention_triggers()
+
+    assert model.topic_heat["T001"][GroupType.CAMPUS] < model.heat_threshold, \
+        "本测试要求热度低于阈值，否则测不出「负面高但不热」"
+    assert model.topic_negative["T001"][GroupType.CAMPUS] >= model.negative_threshold
+    assert model.intervention_tick[GroupType.CAMPUS] is not None, \
+        "负面超阈却没有触发干预 —— 问题①未修复"
+    assert model.intervention_tick[GroupType.DORM] is None, \
+        "DORM 群 t_int = +∞，永不触发"
+
+
+def _test_v3_event_source_injects():
+    """问题②：事件源是独立模块，随机投到小群或大群，并留下 EventRecord。"""
+    from types_def import SMALL_GROUPS, LARGE_GROUPS
+    from event_source import EventSource
+
+    model = _v3_model(inject_initial_event=True)
+    assert isinstance(model.event_source, EventSource)
+    events = model.event_source.events
+    assert len(events) == 1, "初始事件应且仅应投放一次"
+    e = events[0]
+    assert e.is_initial and e.message_id
+    assert e.group_type in tuple(SMALL_GROUPS) + tuple(LARGE_GROUPS)
+    assert e.scope in {"small", "large"}
+    assert any(r.message_id == e.message_id for r in model.info_stream_cache), \
+        "事件消息必须真正进入信息流"
+    assert model.topic_heat["T001"][e.group_type] >= e.heat - 1e-9, \
+        "H₀ 应按事件初始热度写入目标群"
+
+
+def _test_v3_forward_count_gate():
+    """问题③：转发次数未达阈时，跨群通道必须关闭；达阈后才打开。"""
+    from types_def import ActionRecord, ActionType, MessageType, ForwardDirection
+
+    model = _v3_model(
+        cross_group_forward_threshold=2,
+        cross_group_forward_threshold_by_direction={"upward": 2, "lateral": 0, "downward": 3},
+        cross_group_heat_bypass=False,
+    )
+    dorm = [a for a in model.schedule.agents
+            if a.beliefs.identity.group_type.name == "DORM"]
+    assert len(dorm) >= 2, "夹具里应有至少两个宿舍群成员"
+    origin, bridge = dorm[0], dorm[1]
+
+    original = ActionRecord(
+        agent_id=origin.unique_id, action_type=ActionType.SEND_MESSAGE,
+        content="宿舍群原文", tick=0, topic_id="T001",
+        message_type=MessageType.ORIGINAL, heat=0.1, group_id="GROUP_DORM",
+    )
+    assert model.submit_action(original)
+    assert original.forward_count == 0
+
+    # fc=0 时 upward 通道关闭
+    assert not model.is_cross_group_channel_open(original, ForwardDirection.UPWARD)
+    candidates = model.get_forward_destination_candidates(
+        bridge.unique_id, "GROUP_DORM", forward_count=0)
+    assert "GROUP_CAMPUS" not in candidates, "未达门槛却开放了向上跨群通道"
+    assert "GROUP_DORM" in candidates, "群内通道应始终可用（攒转发次数的唯一途径）"
+
+    blocked_before = model.blocked_by_forward_gate
+    bad = ActionRecord(
+        agent_id=bridge.unique_id, action_type=ActionType.FORWARD,
+        content="强行跨群", tick=0, topic_id="T001",
+        group_id="GROUP_CAMPUS", source_message_id=original.message_id,
+    )
+    assert not model.submit_action(bad), "未达门槛的跨群转发必须被拒绝"
+    assert model.blocked_by_forward_gate == blocked_before + 1
+
+    # 两次群内接力后，fc 达阈，向上通道打开
+    prev = original
+    for i in range(2):
+        relay = ActionRecord(
+            agent_id=(bridge if i == 0 else origin).unique_id,
+            action_type=ActionType.FORWARD, content=f"群内接力{i}", tick=0,
+            topic_id="T001", group_id="GROUP_DORM", source_message_id=prev.message_id,
+        )
+        assert model.submit_action(relay)
+        assert relay.forward_direction == ForwardDirection.INTRA
+        assert relay.root_message_id == original.message_id
+        prev = relay
+    assert prev.forward_count == 2
+    assert model.is_cross_group_channel_open(prev, ForwardDirection.UPWARD)
+
+    ok = ActionRecord(
+        agent_id=bridge.unique_id, action_type=ActionType.FORWARD,
+        content="达阈后跨群", tick=0, topic_id="T001",
+        group_id="GROUP_CAMPUS", source_message_id=prev.message_id,
+    )
+    before = model.cross_group_forward
+    assert model.submit_action(ok), "达到门槛后跨群转发应被接受"
+    assert ok.forward_direction == ForwardDirection.UPWARD
+    assert model.cross_group_forward == before + 1
+    assert model.upward_forward >= 1
+
+
+def _test_v3_lateral_small_group_forward():
+    """问题④：DORM↔CLASS 小群互转必须可用，且方向判定正确。"""
+    from types_def import ActionRecord, ActionType, MessageType, GroupType, ForwardDirection
+
+    model = _v3_model()
+    fd = model.forward_direction
+    assert fd(GroupType.DORM, GroupType.CLASS) == ForwardDirection.LATERAL
+    assert fd(GroupType.CLASS, GroupType.DORM) == ForwardDirection.LATERAL
+    assert fd(GroupType.DORM, GroupType.CAMPUS) == ForwardDirection.UPWARD
+    assert fd(GroupType.MAJOR, GroupType.CAMPUS) == ForwardDirection.UPWARD, \
+        "专业群→校园群是「小→大」，不是横向"
+    assert fd(GroupType.CAMPUS, GroupType.CLASS) == ForwardDirection.DOWNWARD
+    assert fd(GroupType.DORM, GroupType.DORM) == ForwardDirection.INTRA
+
+    dorm = [a for a in model.schedule.agents
+            if a.beliefs.identity.group_type == GroupType.DORM]
+    origin, bridge = dorm[0], dorm[1]
+    original = ActionRecord(
+        agent_id=origin.unique_id, action_type=ActionType.SEND_MESSAGE,
+        content="宿舍群原文", tick=0, topic_id="T001",
+        message_type=MessageType.ORIGINAL, heat=0.1, group_id="GROUP_DORM",
+    )
+    assert model.submit_action(original)
+
+    lateral = ActionRecord(
+        agent_id=bridge.unique_id, action_type=ActionType.FORWARD,
+        content="转到班级群", tick=0, topic_id="T001",
+        group_id="GROUP_CLASS", source_message_id=original.message_id,
+    )
+    before = model.lateral_forward
+    assert model.submit_action(lateral), "小群互转门槛为 0，应直接放行"
+    assert lateral.forward_direction == ForwardDirection.LATERAL
+    assert model.lateral_forward == before + 1
+
+    # 向下通道默认开启但权重最低，且门槛最高
+    assert model.forward_threshold_for(ForwardDirection.DOWNWARD) > \
+        model.forward_threshold_for(ForwardDirection.UPWARD) > \
+        model.forward_threshold_for(ForwardDirection.LATERAL)
+    w = model.forward_direction_weights
+    assert w[ForwardDirection.UPWARD] > w[ForwardDirection.LATERAL] > w[ForwardDirection.DOWNWARD], \
+        "方向权重须满足 小→大 > 横向 > 向下"
+
+
+def _test_v3_mute_is_enforced():
+    """问题⑤：禁言必须真正阻断发言，且 DORM 群不可禁言。"""
+    from types_def import ActionRecord, ActionType, AgentType, GroupType, MessageType
+
+    model = _v3_model(enable_mute=True, mute_duration_ticks=3)
+    campus = [a for a in model.schedule.agents
+              if "GROUP_CAMPUS" in a.beliefs.identity.group_ids]
+    controller, victim = campus[0], campus[1]
+    controller.beliefs.identity.agent_type = AgentType.CONTROLLER
+    victim.beliefs.identity.agent_type = AgentType.ORDINARY
+
+    mute = ActionRecord(
+        agent_id=controller.unique_id, action_type=ActionType.MUTE,
+        content="禁言公告", target_id=victim.unique_id, tick=0, topic_id="T001",
+        message_type=MessageType.CLARIFICATION, group_id="GROUP_CAMPUS",
+    )
+    assert model.submit_action(mute), "Controller 的禁言动作应被接受"
+    assert model.mute_count == 1
+    assert model.is_muted(victim.unique_id, "GROUP_CAMPUS")
+    assert "GROUP_CAMPUS" in model.get_muted_groups(victim.unique_id)
+    assert model.governance_tick[GroupType.CAMPUS] is not None, \
+        "禁言应标记 Controller 已实际干预（恢复机制的起点）"
+
+    blocked = ActionRecord(
+        agent_id=victim.unique_id, action_type=ActionType.SEND_MESSAGE,
+        content="我还想说话", tick=0, topic_id="T001", group_id="GROUP_CAMPUS",
+    )
+    assert not model.submit_action(blocked), "被禁言者不应还能发言 —— 问题⑤未修复"
+    assert model.blocked_by_mute >= 1
+
+    # 非 Controller 不能禁言
+    bad = ActionRecord(
+        agent_id=victim.unique_id, action_type=ActionType.MUTE,
+        content="越权禁言", target_id=controller.unique_id, tick=0,
+        topic_id="T001", group_id="GROUP_CAMPUS",
+    )
+    assert not model.submit_action(bad)
+
+    # DORM 群管理强度最低，禁言不成立
+    dorm_ctrl = [a for a in model.schedule.agents
+                 if a.beliefs.identity.group_type == GroupType.DORM]
+    dorm_ctrl[0].beliefs.identity.agent_type = AgentType.CONTROLLER
+    dorm_mute = ActionRecord(
+        agent_id=dorm_ctrl[0].unique_id, action_type=ActionType.MUTE,
+        content="宿舍群禁言", target_id=dorm_ctrl[1].unique_id, tick=0,
+        topic_id="T001", group_id="GROUP_DORM",
+    )
+    assert not model.submit_action(dorm_mute), "DORM 群不应允许禁言"
+
+    # 到期自动解禁
+    model.schedule.time = 99
+    model._update_environment()
+    assert not model.is_muted(victim.unique_id, "GROUP_CAMPUS")
+
+
+def _test_v3_exposure_effects():
+    """问题⑥：曝光必须同时影响热度增益与注意力配额。"""
+    from types_def import ActionRecord, ActionType, MessageType, GroupType, GROUP_EXPOSURE
+
+    assert (GROUP_EXPOSURE[GroupType.DORM] < GROUP_EXPOSURE[GroupType.CLASS]
+            < GROUP_EXPOSURE[GroupType.MAJOR] < GROUP_EXPOSURE[GroupType.CAMPUS])
+
+    model = _v3_model(exposure_heat_weight=1.0)
+    dorm_agent = next(a for a in model.schedule.agents
+                      if a.beliefs.identity.group_type == GroupType.DORM)
+
+    def _post(group_id):
+        rec = ActionRecord(
+            agent_id=dorm_agent.unique_id, action_type=ActionType.SEND_MESSAGE,
+            content="同一条消息", tick=0, topic_id="T001",
+            message_type=MessageType.ORIGINAL, negative_score=0.5, heat=1.0,
+            group_id=group_id,
+        )
+        assert model.submit_action(rec)
+
+    _post("GROUP_DORM")
+    _post("GROUP_CAMPUS")
+    h_dorm = model.topic_heat["T001"][GroupType.DORM]
+    h_campus = model.topic_heat["T001"][GroupType.CAMPUS]
+    assert h_campus > h_dorm, \
+        f"同一条消息在高曝光群应掀起更高热度，实际 CAMPUS={h_campus:.4f} DORM={h_dorm:.4f}"
+
+    # 注意力配额：低曝光群也必须保底有名额，否则小群消息永远被大群刷掉
+    for i in range(60):
+        _post("GROUP_CAMPUS")
+    visible = model.get_group_messages(dorm_agent.unique_id, limit=20)
+    groups = {r.group_id for r in visible}
+    assert "GROUP_DORM" in groups, "低曝光群的消息不应被高曝光群完全挤掉"
+    assert len(visible) <= 20
+
+
+def _test_v3_control_level_formula():
+    """问题⑦：「基础降温 × control_level」必须与 §4.2 指数公式逐位等价。"""
+    import math
+    from types_def import (ALPHA, GROUP_BETA, GROUP_CONTROL_LEVEL, GroupType,
+                           heat_decay)
+
+    for g in GroupType:
+        cl = GROUP_CONTROL_LEVEL[g]
+        assert cl > 1.0, "control_level 必须 > 1"
+        assert abs(GROUP_BETA[g] - ALPHA * (cl - 1.0)) < 1e-12, \
+            "β_k 必须等于 α·(control_level_k − 1)"
+        lhs = heat_decay(1.0, g, intervened=True)                 # 文字版
+        rhs = math.exp(-ALPHA) * math.exp(-GROUP_BETA[g])          # §4.2 公式版
+        assert abs(lhs - rhs) < 1e-12, f"{g.name} 两种表述不等价"
+    assert (GROUP_CONTROL_LEVEL[GroupType.DORM] < GROUP_CONTROL_LEVEL[GroupType.CLASS]
+            < GROUP_CONTROL_LEVEL[GroupType.MAJOR] < GROUP_CONTROL_LEVEL[GroupType.CAMPUS])
+    # 管理越强降得越快
+    assert (heat_decay(1.0, GroupType.CAMPUS, True)
+            < heat_decay(1.0, GroupType.MAJOR, True)
+            < heat_decay(1.0, GroupType.CLASS, True)
+            < heat_decay(1.0, GroupType.DORM, True))
+
+
+def _test_v3_trust_and_bias_modeled():
+    """问题⑧：trust / confirmation_bias 必须单独建模，且按角色分层。"""
+    from types_def import PsychologyBelief, AgentType
+
+    psy = PsychologyBelief()
+    assert hasattr(psy, "trust") and hasattr(psy, "confirmation_bias")
+
+    model = _v3_model(n=120)
+    by_role = {}
+    for agent in model.schedule.agents:
+        role = agent.beliefs.identity.agent_type
+        p = agent.beliefs.psychology
+        assert 0.0 <= p.trust <= 1.0 and 0.0 <= p.confirmation_bias <= 1.0
+        by_role.setdefault(role, []).append((p.trust, p.confirmation_bias))
+
+    def _mean(role, idx):
+        vals = [v[idx] for v in by_role.get(role, [])]
+        return sum(vals) / len(vals) if vals else 0.5
+
+    assert _mean(AgentType.RATIONAL, 0) < _mean(AgentType.ORDINARY, 0), \
+        "理性讨论者的信任度应低于普通群员"
+    assert _mean(AgentType.RATIONAL, 1) < _mean(AgentType.ACTIVE, 1), \
+        "理性讨论者的确认偏误应低于活跃讨论者"
+
+
+def _test_v3_full_cycle_smoke():
+    """端到端：事件源 → 扩散 → 负面超阈 → Controller 干预 → 恢复。"""
+    from types_def import SimConfig
+    from opinion_model import OpinionModel
+
+    triggered = governed = recovered = 0
+    for seed in (11, 42, 77, 2026):
+        model = OpinionModel(SimConfig(n_agents=80, network_params={"m": 3},
+                                       random_seed=seed))
+        for _ in range(50):
+            model.step()
+        summary = model.get_final_summary()
+        assert summary["event_source"]["n_events"] >= 1
+        triggered += summary["earliest_intervention_tick"] is not None
+        governed += any(t is not None for t in model.governance_tick.values())
+        recovered += summary["recovery_time"] is not None
+        df = model.datacollector.get_model_vars_dataframe()
+        assert df.isnull().sum().sum() == 0
+    assert triggered >= 2, f"4 个种子里只有 {triggered} 个触发干预，触发条件可能过严"
+    assert governed >= 2, "Controller 应在多数种子下实际动手"
+
+
 # ═══════════════════════════════════════════════════════════════════ #
 # 执行所有测试
 # ═══════════════════════════════════════════════════════════════════ #
 
 if __name__ == "__main__":
     print("\n" + "═" * 60)
-    print("  接口契约验证  (test_contract.py · v2 · W4)")
+    print("  接口契约验证  (test_contract.py · v3 · 场景对齐版)")
     print("═" * 60)
 
     print("\n── [types]  types_def.py 共享类型（v2）")
@@ -672,6 +1031,17 @@ if __name__ == "__main__":
     _check("宏观扩散与 Agent 转发指标分离", _test_macro_spread_separate_from_forward)
     _check("_place_agents 建立分层多群成员关系", _test_model_place_agents_group_type)
     _check("n=1 单节点 5步不崩溃",             _test_model_single_node)
+
+    print("\n── [A · v3]  场景一致性（对应《场景设定》与流程图的 8 个问题）")
+    _check("① 负面超阈触发干预（热度不高也触发）", _test_v3_negative_triggers_without_heat)
+    _check("② 事件源独立模块随机投小群/大群",      _test_v3_event_source_injects)
+    _check("③ 转发次数门槛控制跨群通道开闭",       _test_v3_forward_count_gate)
+    _check("④ DORM↔CLASS 小群互转与方向判定",     _test_v3_lateral_small_group_forward)
+    _check("⑤ 禁言真实阻断发言、DORM 不可禁言",   _test_v3_mute_is_enforced)
+    _check("⑥ 曝光影响热度增益与注意力配额",       _test_v3_exposure_effects)
+    _check("⑦ 基础降温×control_level 与§4.2等价", _test_v3_control_level_formula)
+    _check("⑧ trust/confirmation_bias 分角色建模", _test_v3_trust_and_bias_modeled)
+    _check("端到端：投放→扩散→超阈→干预→恢复",   _test_v3_full_cycle_smoke)
 
     n_pass = sum(1 for r in _results if r[0] == "✅")
     n_fail = sum(1 for r in _results if r[0] == "❌")
