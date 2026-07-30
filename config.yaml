@@ -107,6 +107,25 @@ scenario_params:
   message_expire_ticks: 10
   negative_smoothing: 0.50
 
+  # ── 仿真时钟（A 模块 tick→真实时段映射，问题①）─────────────────────
+  # 50 步 × 3600s/tick ≈ 模拟约 2 天的校园舆情演化
+  # 第 0 tick 对应 09:00，第 8 tick ≈ 17:00（晚间自由开始）
+  tick_seconds: 3600      # 每 tick = 1 小时
+  day_schedule:           # 自定义日程（覆盖 types_def.DEFAULT_DAY_SCHEDULE）
+    tick_seconds: 3600
+    day_start_hour: 9     # 仿真从早 9 点开始
+    slots:
+      - name: morning_class
+        hours: [9, 12]
+      - name: lunch
+        hours: [12, 14]
+      - name: afternoon_class
+        hours: [14, 17]
+      - name: evening_free
+        hours: [17, 22]
+      - name: late_night
+        hours: [22, 33]   # 22:00 到次日 09:00（33=24+9）
+
 llm_config: {}
 
 random_seed: 42     # A 模块自测用固定种子，保证可复现；做实验时改成 null

@@ -347,6 +347,14 @@ class SocialAgent(Agent):
         topic_heat_by_group = self.model.get_topic_heat_by_group(self.unique_id)
         topic_negative_by_group = self.model.get_topic_negative_by_group(self.unique_id)
 
+        # ── 仿真时钟上下文（A 模块 tick→时段常识，问题 place/time_of_day）──
+        clock_ctx = {}
+        if hasattr(self.model, "get_clock_context"):
+            try:
+                clock_ctx = self.model.get_clock_context(group_type=group_type)
+            except Exception:
+                clock_ctx = {}
+
         perception = Perception(
             group_id=group_id,
             group_ids=group_ids,
@@ -366,6 +374,15 @@ class SocialAgent(Agent):
             topic_negative_by_group=topic_negative_by_group,
             intervened_groups=self.model.get_intervened_groups(self.unique_id),
             muted_groups=self.model.get_muted_groups(self.unique_id),
+            # 时钟字段
+            sim_time_seconds=int(clock_ctx.get("sim_time_seconds", 0)),
+            wall_hour=float(clock_ctx.get("wall_hour", 9.0)),
+            time_slot=str(clock_ctx.get("time_slot", "")),
+            place=str(clock_ctx.get("place", "")),
+            activity=str(clock_ctx.get("activity", "")),
+            group_activity_multiplier=float(
+                clock_ctx.get("group_activity_multiplier", 1.0)),
+            topic_suitability=dict(clock_ctx.get("topic_suitability", {})),
         )
         self._last_perception = perception
         return perception
@@ -420,6 +437,13 @@ class SocialAgent(Agent):
                     },
                     "role":       self.beliefs.identity.agent_type.name,
                     "nickname":   self.beliefs.identity.nickname,
+                    # 仿真时钟 / 时段常识（place + time_of_day）
+                    "time_slot":        perception.time_slot,
+                    "wall_hour":        perception.wall_hour,
+                    "place":            perception.place,
+                    "activity":         perception.activity,
+                    "group_activity":   perception.group_activity_multiplier,
+                    "topic_suitability": perception.topic_suitability,
                     # 给 LLM 稳定的消息 ID 与群路由字段，禁止凭空造来源。
                     "recent_messages": [
                         {
@@ -748,7 +772,12 @@ class SocialAgent(Agent):
                     destination_group_id=distorted.group_id,
                 ))
 
-        if emotion.arousal > 0.65 and emotion.valence < -0.2 and hottest_group_id not in muted_groups:
+        # 情绪触发讨论：晚间自由时段（time_activity≈1.0）更容易被情绪推动发言；
+        # 上课时段（time_activity≈0.2）则需要更高的情绪唤醒才愿意"插嘴"
+        arousal_threshold_discuss = float(np.clip(0.40 + 0.30 * (1.0 - time_activity), 0.40, 0.70))
+        if (emotion.arousal > arousal_threshold_discuss
+                and emotion.valence < -0.2
+                and hottest_group_id not in muted_groups):
             desires.append(Desire(
                 "discuss",
                 priority=0.7,
@@ -756,7 +785,11 @@ class SocialAgent(Agent):
                 destination_group_id=hottest_group_id,
             ))
 
-        # ── 转发（问题③④⑥⑧）────────────────────────────────────────
+        # ── 转发（问题③④⑥⑧ + 时段活跃度）───────────────────────────
+        # 时段活跃度乘数：上课时间（0.15–0.85）/ 晚间自由（1.00）
+        time_activity = float(
+            perception.group_activity_multiplier if perception else 1.0)
+
         forward_source = self._select_forward_source()
         if forward_source is not None:
             destination_group_id = self.model.select_forward_destination(
@@ -778,6 +811,8 @@ class SocialAgent(Agent):
                 trust = float(np.clip(psychology.trust, 0.0, 1.0))
                 base_p *= float(np.clip(1.0 - forward_source.distortion_level * (1.0 - trust),
                                         0.05, 1.0))
+                # 时段活跃度：上课期间转发概率随活跃度乘数下降
+                base_p *= float(np.clip(time_activity, 0.05, 1.0))
 
                 share_priority: Optional[float] = None
                 if self.model.random.random() < base_p:

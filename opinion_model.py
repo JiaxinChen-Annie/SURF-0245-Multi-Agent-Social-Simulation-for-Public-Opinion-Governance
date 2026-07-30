@@ -113,9 +113,144 @@ from types_def import (
     ALPHA, THETA, HEAT_CAP,
     GROUP_BETA, GROUP_CONTROL_LEVEL, GROUP_EXPOSURE, GROUP_BAND,
     CONTROLLER_ONLY_ACTIONS, DEFAULT_SCENARIO_PARAMS, LATERAL_PAIRS,
+    TimeSlot, TIME_SLOT_GROUP_ACTIVITY, TIME_SLOT_TOPIC_SUITABILITY,
+    DEFAULT_DAY_SCHEDULE,
     heat_decay as _formula_heat_decay,
 )
 from event_source import EventSource
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #
+#  仿真时钟引擎（A 模块 tick → 真实时段映射）                               #
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ #
+
+# 各时段对应的「place」与「activity」描述（供 LLM prompt / 规则存根使用）
+_TIME_SLOT_CONTEXT: Dict[str, Dict[str, str]] = {
+    TimeSlot.MORNING_CLASS: {
+        "place":    "教室",
+        "activity": "早上上课",
+    },
+    TimeSlot.LUNCH: {
+        "place":    "食堂/宿舍",
+        "activity": "午休",
+    },
+    TimeSlot.AFTERNOON_CLASS: {
+        "place":    "教室",
+        "activity": "下午上课",
+    },
+    TimeSlot.EVENING_FREE: {
+        "place":    "宿舍/校园",
+        "activity": "晚间自由",
+    },
+    TimeSlot.LATE_NIGHT: {
+        "place":    "宿舍",
+        "activity": "深夜",
+    },
+}
+
+
+class SimClock:
+    """
+    仿真时钟：把离散的 tick 编号转换成「现实时段」语义。
+
+    ──────────────────────────────────────────────────────────────────────
+    设计目标：
+      tick 是调度上的整数步，但 Agent 的行为应受「几点了 / 在哪里」的
+      常识约束：上课时间不是刷宿舍群八卦的高峰；晚间自由才是舆情扩散
+      的主要时段。SimClock 把这套粗粒度时段常识注入 Perception，让
+      LLM 路径和规则存根都能读到它。
+
+    使用方式（opinion_model._perceive_clock_context）：
+        clock = SimClock(tick_seconds=3600, day_schedule=None)
+        ctx = clock.context(tick=7)
+        # ctx.time_slot   → "evening_free"
+        # ctx.wall_hour   → 16.0  (如果 day_start_hour=9，tick 7 = 9+7 = 16)
+        # ctx.place       → "宿舍/校园"
+        # ctx.activity    → "晚间自由"
+        # ctx.group_activity_multiplier(GroupType.DORM) → 1.00
+    ──────────────────────────────────────────────────────────────────────
+    """
+
+    def __init__(
+        self,
+        tick_seconds: int = 3600,
+        day_schedule: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.tick_seconds = max(1, int(tick_seconds))
+        schedule = day_schedule if day_schedule is not None else DEFAULT_DAY_SCHEDULE
+        self.day_start_hour: float = float(schedule.get("day_start_hour", 9))
+        # 解析时段列表；slots 的 "hours" 字段为 [start_h, end_h)
+        self._slots: List[Dict[str, Any]] = list(schedule.get("slots", []))
+
+    def wall_hour(self, tick: int) -> float:
+        """返回 tick 对应的现实小时数（24h 浮点）。"""
+        elapsed_seconds = int(tick) * self.tick_seconds
+        elapsed_hours = elapsed_seconds / 3600.0
+        return (self.day_start_hour + elapsed_hours) % 24.0
+
+    def time_slot(self, tick: int) -> str:
+        """
+        返回 tick 对应的 TimeSlot 标签。
+
+        按「现实小时」匹配 slots 列表中的区间（支持跨午夜的 hours=[22,33]）。
+        无匹配时回退到 LATE_NIGHT。
+        """
+        hour = self.day_start_hour + (int(tick) * self.tick_seconds / 3600.0)
+        # hour 可能超过 24，不 mod（方便跨午夜区间匹配）
+        for slot in self._slots:
+            h_start, h_end = slot["hours"][0], slot["hours"][1]
+            if h_start <= hour % 24 < h_end or (
+                h_end > 24 and (hour % 24 >= h_start or hour % 24 < h_end - 24)
+            ):
+                return slot["name"]
+        return TimeSlot.LATE_NIGHT
+
+    def group_activity_multiplier(self, tick: int, group_type: GroupType) -> float:
+        """返回当前时段该群类型的活跃度乘数。"""
+        slot = self.time_slot(tick)
+        table = TIME_SLOT_GROUP_ACTIVITY.get(slot, {})
+        return float(table.get(group_type.name, 1.0))
+
+    def hawkes_mu_factor(self, tick: int) -> float:
+        """
+        根据时段调整 Hawkes 基线强度 μ 的乘数（问题文档 C 节提到
+        「若加时段活跃度，可让 μ 随 time_of_day 变化」）。
+
+        使用所有群活跃度的平均值作为全局激活率的调节因子。
+        """
+        slot = self.time_slot(tick)
+        table = TIME_SLOT_GROUP_ACTIVITY.get(slot, {})
+        mults = list(table.values())
+        return float(sum(mults) / len(mults)) if mults else 1.0
+
+    def topic_suitability(self, tick: int) -> Dict[str, float]:
+        """返回当前时段各话题类型的适合性分数。"""
+        slot = self.time_slot(tick)
+        return dict(TIME_SLOT_TOPIC_SUITABILITY.get(slot, {}))
+
+    def clock_context(self, tick: int, group_type: GroupType) -> Dict[str, Any]:
+        """
+        返回完整的时钟上下文字典，供 Perception 填充。
+
+        字段含义：
+          sim_time_seconds        : 仿真已流逝秒数
+          wall_hour               : 对应现实小时（浮点）
+          time_slot               : TimeSlot 标签
+          place / activity        : 时段常识描述
+          group_activity_multiplier : 该群在当前时段的活跃度乘数
+          topic_suitability       : 各话题适合性
+        """
+        slot = self.time_slot(tick)
+        ctx_desc = _TIME_SLOT_CONTEXT.get(slot, {"place": "未知", "activity": "未知"})
+        return {
+            "sim_time_seconds":          int(tick) * self.tick_seconds,
+            "wall_hour":                 self.wall_hour(tick),
+            "time_slot":                 slot,
+            "place":                     ctx_desc["place"],
+            "activity":                  ctx_desc["activity"],
+            "group_activity_multiplier": self.group_activity_multiplier(tick, group_type),
+            "topic_suitability":         self.topic_suitability(tick),
+        }
 
 _LOG = logging.getLogger("OpinionModel")
 
@@ -240,6 +375,15 @@ class OpinionModel(Model):
             sp.get("exposure_perception_weight"), 0.60)
         self.forward_exposure_weight = _as_probability(
             sp.get("forward_exposure_weight"), 0.50)
+
+        # ── 仿真时钟（A 模块 tick→真实时段映射）──────────────────────────
+        tick_seconds = max(1, _as_int(sp.get("tick_seconds"), 3600))
+        day_schedule = sp.get("day_schedule") or None    # None → 使用 DEFAULT_DAY_SCHEDULE
+        self.sim_clock = SimClock(tick_seconds=tick_seconds, day_schedule=day_schedule)
+        _LOG.info(
+            "仿真时钟已初始化 | tick_seconds=%d（每 tick≈%.1f 分钟）| day_start=%s",
+            tick_seconds, tick_seconds / 60.0, self.sim_clock.day_start_hour,
+        )
 
         # ── 热度标度与失真恢复 ────────────────────────────────────────
         self.base_heat_gain = max(0.0, _as_float(sp.get("base_heat_gain"), 0.055))
@@ -381,6 +525,11 @@ class OpinionModel(Model):
                 "mute_count":           lambda m: m.mute_count,
                 "active_mutes":         lambda m: m._count_active_mutes(),
                 "n_intervened_groups":  lambda m: m._count_intervened_groups(),
+                # 仿真时钟列（A 模块新增，对应问题①「tick→时钟」）
+                "wall_hour":            lambda m: m.get_wall_hour(),
+                "time_slot":            lambda m: m.get_time_slot(),
+                "time_mu_factor":       lambda m: m.sim_clock.hawkes_mu_factor(
+                                            int(m.schedule.time)),
             }
         )
 
@@ -570,10 +719,13 @@ class OpinionModel(Model):
         self._refresh_group_negative()
         self._evaluate_intervention_triggers()
 
-        # ── ④ Hawkes 激活比例 ────────────────────────────────────────
+        # ── ④ Hawkes 激活比例（乘以时段活跃度乘数，μ 随 time_of_day 变化）──
         lam = self.hawkes.intensity(t)
         mu = self.config.hawkes_params.get("mu", 0.1)
-        activation_rate = float(np.clip(0.30 * lam / max(mu, 1e-9), 0.10, 0.80))
+        # 时段因子：晚间自由≈1.0，上课时段≈0.4；用它调节 Hawkes μ 对激活率的贡献
+        time_mu_factor = self.sim_clock.hawkes_mu_factor(int(t))
+        effective_mu = max(mu * time_mu_factor, 1e-9)
+        activation_rate = float(np.clip(0.30 * lam / effective_mu, 0.10, 0.80))
 
         all_agents = list(self.schedule.agents)
         n_active = max(1, int(len(all_agents) * activation_rate))
@@ -1353,6 +1505,35 @@ class OpinionModel(Model):
     def _count_active_mutes(self) -> int:
         current_tick = int(self.schedule.time)
         return sum(1 for until in self.muted_until.values() if current_tick < until)
+
+    # ================================================================== #
+    #  仿真时钟接口（供 social_agent._perceive 调用）                      #
+    # ================================================================== #
+
+    def get_clock_context(self, group_type: Optional[GroupType] = None) -> Dict[str, Any]:
+        """
+        返回当前 tick 的时钟上下文（time_slot / wall_hour / place / activity /
+        group_activity_multiplier / topic_suitability）。
+
+        供 social_agent._perceive() 填充 Perception 的时钟字段，以及 LLM
+        prompt builder 读取「现在几点、在哪里、在做什么」的常识背景。
+
+        Parameters
+        ----------
+        group_type : 目标群类型（影响 group_activity_multiplier）。
+                     None 时返回 CAMPUS（全局均值群）的数据。
+        """
+        tick = int(self.schedule.time)
+        gt = group_type if group_type is not None else GroupType.CAMPUS
+        return self.sim_clock.clock_context(tick, gt)
+
+    def get_time_slot(self) -> str:
+        """返回当前 tick 的时段标签（TimeSlot 字符串）。"""
+        return self.sim_clock.time_slot(int(self.schedule.time))
+
+    def get_wall_hour(self) -> float:
+        """返回当前 tick 对应的现实小时（24h 浮点）。"""
+        return self.sim_clock.wall_hour(int(self.schedule.time))
 
     # ================================================================== #
     #  B 模块接口适配（供 social_agent._perceive 调用）                    #

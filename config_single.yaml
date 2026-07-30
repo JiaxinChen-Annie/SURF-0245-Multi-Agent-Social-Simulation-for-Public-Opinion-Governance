@@ -97,6 +97,10 @@ scenario_params:
   message_expire_ticks: 10
   negative_smoothing: 0.50
 
+  # 仿真时钟
+  tick_seconds: 3600
+  day_schedule: null   # 使用 types_def.DEFAULT_DAY_SCHEDULE
+
 llm_config: {}
 
 random_seed: null   # null = 每次随机种子

@@ -97,6 +97,23 @@ scenario_params:
   message_expire_ticks: 10
   negative_smoothing: 0.50
 
+  # 仿真时钟（同 config.yaml）
+  tick_seconds: 3600
+  day_schedule:
+    tick_seconds: 3600
+    day_start_hour: 9
+    slots:
+      - name: morning_class
+        hours: [9, 12]
+      - name: lunch
+        hours: [12, 14]
+      - name: afternoon_class
+        hours: [14, 17]
+      - name: evening_free
+        hours: [17, 22]
+      - name: late_night
+        hours: [22, 33]
+
 llm_config: {}
 
 random_seed: null   # null = 每次随机种子

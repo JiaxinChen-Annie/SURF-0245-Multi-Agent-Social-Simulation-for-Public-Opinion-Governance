@@ -121,6 +121,118 @@ class InterventionType(IntEnum):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 仿真时钟 / 日程常识（A 模块 tick → 真实时段映射）
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class TimeSlot:
+    """
+    粗粒度时段标签（「斯坦福小镇」式日程，先做粗粒度版本）。
+
+    MORNING_CLASS  早上上课（09:00–12:00）：专业/班级群活跃，宿舍群安静
+    LUNCH          午休（12:00–14:00）：小群闲聊，横向传播小高峰
+    AFTERNOON_CLASS 下午上课（14:00–17:00）：同 MORNING_CLASS
+    EVENING_FREE   晚间自由（17:00–22:00）：宿舍群/班级群最活跃，舆情主高峰
+    LATE_NIGHT     深夜（22:00–09:00）：整体静默，专业/校园群运营号偶发
+    """
+    MORNING_CLASS   = "morning_class"
+    LUNCH           = "lunch"
+    AFTERNOON_CLASS = "afternoon_class"
+    EVENING_FREE    = "evening_free"
+    LATE_NIGHT      = "late_night"
+
+
+#: 各时段的「群活跃度乘数」：决定 Agent 本时段愿意发言/转发的概率修正。
+#: ORDINARY 等沉默群众晚间才"冒泡"，ACTIVE 全天较活跃但晚间更高。
+TIME_SLOT_GROUP_ACTIVITY: Dict[str, Dict[str, float]] = {
+    # time_slot -> { group_type_name -> activity_multiplier }
+    TimeSlot.MORNING_CLASS: {
+        "DORM":   0.20,   # 都去上课了，宿舍群极静
+        "CLASS":  0.85,   # 班级群：课前签到、作业讨论
+        "MAJOR":  0.70,   # 专业群：学术提问
+        "CAMPUS": 0.50,
+    },
+    TimeSlot.LUNCH: {
+        "DORM":   0.70,
+        "CLASS":  0.65,
+        "MAJOR":  0.50,
+        "CAMPUS": 0.60,
+    },
+    TimeSlot.AFTERNOON_CLASS: {
+        "DORM":   0.15,
+        "CLASS":  0.80,
+        "MAJOR":  0.75,
+        "CAMPUS": 0.45,
+    },
+    TimeSlot.EVENING_FREE: {
+        "DORM":   1.00,   # 晚间宿舍群最活跃（八卦、讨论舍友、吐槽事件）
+        "CLASS":  0.90,
+        "MAJOR":  0.60,
+        "CAMPUS": 0.70,
+    },
+    TimeSlot.LATE_NIGHT: {
+        "DORM":   0.20,   # 只有夜猫子还在
+        "CLASS":  0.15,
+        "MAJOR":  0.25,   # 学术讨论偶发
+        "CAMPUS": 0.30,   # 官方号可能发通告
+    },
+}
+
+#: 各时段中「允许讨论」的话题约束（place/activity 常识）。
+#: 仅作软约束：Agent 感知里会携带，LLM/规则根据它调整 content_plan。
+#: 键为话题类型标签，值为适合性分数 [0,1]（1=完全适合，0=极不适合）。
+TIME_SLOT_TOPIC_SUITABILITY: Dict[str, Dict[str, float]] = {
+    # 大学校园场景下典型话题与时段适配性
+    TimeSlot.MORNING_CLASS: {
+        "academic":    0.90,   # 课程、作业、考试
+        "campus_news": 0.60,
+        "gossip":      0.20,   # 上课期间八卦不适合
+        "event":       0.50,
+    },
+    TimeSlot.LUNCH: {
+        "academic":    0.40,
+        "campus_news": 0.80,
+        "gossip":      0.85,
+        "event":       0.90,
+    },
+    TimeSlot.AFTERNOON_CLASS: {
+        "academic":    0.85,
+        "campus_news": 0.55,
+        "gossip":      0.15,
+        "event":       0.50,
+    },
+    TimeSlot.EVENING_FREE: {
+        "academic":    0.35,
+        "campus_news": 0.80,
+        "gossip":      1.00,   # 晚间八卦/事件扩散的主要时段
+        "event":       1.00,
+    },
+    TimeSlot.LATE_NIGHT: {
+        "academic":    0.25,
+        "campus_news": 0.50,
+        "gossip":      0.50,
+        "event":       0.55,
+    },
+}
+
+#: 默认日程表：将 tick 索引映射到时段。
+#: 假设一个完整「仿真日」= 24 个 tick，每 tick ≈ 1 小时。
+#: 若 tick_seconds 使每 tick 不足 1 小时，这里的映射按「当日小时数」折算。
+DEFAULT_DAY_SCHEDULE: Dict[str, Any] = {
+    # 仿真时钟参数
+    "tick_seconds":    3600,        # 每 tick 代表多少秒（默认 1 小时）
+    "day_start_hour":  9,           # 仿真"第 0 tick"对应现实几点（24h 制）
+    # 各时段的小时范围列表（闭区间 [start, end)）
+    "slots": [
+        {"name": TimeSlot.MORNING_CLASS,   "hours": [9,  12]},
+        {"name": TimeSlot.LUNCH,           "hours": [12, 14]},
+        {"name": TimeSlot.AFTERNOON_CLASS, "hours": [14, 17]},
+        {"name": TimeSlot.EVENING_FREE,    "hours": [17, 22]},
+        {"name": TimeSlot.LATE_NIGHT,      "hours": [22, 33]},  # 33 = 次日09点（跨午夜）
+    ],
+}
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 热度演化模型常量（《场景设定》§4.2）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -351,6 +463,14 @@ class Perception:
     topic_negative_by_group: Dict[str, Dict[str, float]] = field(default_factory=dict)
     intervened_groups: List[str]               = field(default_factory=list)  # v3 新增
     muted_groups:      List[str]               = field(default_factory=list)  # v3 新增：本人被禁言的群
+    # ── 仿真时钟 / 时段常识（A 模块 tick→时钟 新增）──────────────────────
+    sim_time_seconds:  int                     = 0      # 仿真已流逝秒数（tick × tick_seconds）
+    wall_hour:         float                   = 9.0    # 对应现实几点（24h 浮点，如 13.5 = 13:30）
+    time_slot:         str                     = ""     # TimeSlot 标签（morning_class / evening_free …）
+    place:             str                     = ""     # 当前时段最可能的活动场所（"classroom" / "dorm" …）
+    activity:          str                     = ""     # 当前时段活动摘要（"上课" / "晚间自由" …）
+    group_activity_multiplier: float           = 1.0    # 主群在当前时段的活跃度乘数
+    topic_suitability: Dict[str, float]        = field(default_factory=dict)  # 各话题适合性
 
 
 @dataclass
@@ -518,6 +638,12 @@ DEFAULT_SCENARIO_PARAMS: Dict[str, Any] = {
     "heat_cap": HEAT_CAP,
     "message_expire_ticks": 10,
     "negative_smoothing": 0.50,
+
+    # ── 仿真时钟（A 模块 tick→真实时段映射）──────────────────────────────
+    # tick_seconds  : 每个仿真 tick 对应现实多少秒。默认 3600（1小时/tick）。
+    # day_schedule  : 覆盖 DEFAULT_DAY_SCHEDULE 的自定义日程；不填则使用默认值。
+    "tick_seconds":  3600,
+    "day_schedule":  None,   # None 表示使用 types_def.DEFAULT_DAY_SCHEDULE
 }
 
 
