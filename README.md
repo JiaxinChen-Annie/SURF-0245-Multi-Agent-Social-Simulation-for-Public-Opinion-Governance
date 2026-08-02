@@ -26,6 +26,17 @@ S1: Build basic closed-loop simulation without LLM; S2: Single-agent LLM reasoni
 - `/output`: Exported CSV/JSON simulation data, visualized trend charts
 - `/report`: Draft of academic research report, experimental analysis materials
 
+## Module D Update Notes
+This D-module version adds governance-oriented strategy evaluation:
+
+1. `governance_tick` is used as the real official intervention tick. `intervention_tick` remains a compatible fallback.
+2. `eval_window` defines the before/after evaluation window around `governance_tick`.
+3. `rolling_window` is used for smoother negative-emotion and emotional-contagion comparison.
+4. Reports now include both `GroupType` and `AgentType` slices, in addition to global averages.
+5. `time_profile` can represent different governance intensity in different periods, such as class time and evening time.
+
+For ABC integration details, see `README_D_TO_ABC.md`.
+
 ## Pre-requisites for Contributors
 Undergraduates majoring in CS/AI/Data Science; Basic Python programming; Familiarity with Mesa or rapid learning ability; Basic understanding of machine learning & public opinion communication.
 All team members develop independently in their exclusive modules with standardized external interfaces to minimize cross-module communication costs.
