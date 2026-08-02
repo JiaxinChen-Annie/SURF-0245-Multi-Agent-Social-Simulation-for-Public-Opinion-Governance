@@ -1,0 +1,30 @@
+{
+  "config_path": "E:\\SURF\\SURF C\\联调_ABCDE\\config_100_mock.yaml",
+  "n_agents": 100,
+  "n_steps": 50,
+  "network_type": "barabasi_albert",
+  "random_seed": 42,
+  "llm_provider": "mock",
+  "llm_model": "",
+  "init_seconds": 0.0082,
+  "run_seconds": 0.8329,
+  "total_seconds": 0.8412,
+  "seconds_per_step": 0.016658,
+  "step_seconds_mean": 0.016563,
+  "step_seconds_max": 0.018616,
+  "step_seconds_min": 0.004784,
+  "all_pass": true,
+  "final_metrics": {
+    "tick": 49.0,
+    "avg_opinion": 0.043059347206644,
+    "polarization": 0.6014783254957148,
+    "emotional_contagion": 0.008692660138372969,
+    "message_count": 109.0,
+    "negative_emotion": 0.59,
+    "distortion_level": 0.005,
+    "cross_group_forward": 94.0,
+    "intervention_tick": 0.0,
+    "recovery_time": 0.0,
+    "step_seconds": 0.015343999490141869
+  }
+}

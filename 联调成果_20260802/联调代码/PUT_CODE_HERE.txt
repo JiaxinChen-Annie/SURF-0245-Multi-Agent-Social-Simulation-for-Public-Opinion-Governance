@@ -1,0 +1,15 @@
+请把本机联调可运行代码整棵拷进本目录（覆盖此说明文件即可）。
+
+建议来源：
+  E:\SURF\SURF C\联调_ABCDE\
+
+至少应包含（按你仓库实际文件名调整）：
+  - opinion_model.py / types_def.py / social_agent.py / event_source.py
+  - hawkes_engine.py / llm_utils.py
+  - strategy_eval.py / abc_model_adapter.py / plot_run_report.py
+  - run_sim.py 及相关 mesa_*、configs、scripts
+  - requirements 或环境说明（如有）
+
+不要上传：
+  - .env、含 API Key 的本地配置
+  - __pycache__、.venv、超大临时缓存（可选排除）

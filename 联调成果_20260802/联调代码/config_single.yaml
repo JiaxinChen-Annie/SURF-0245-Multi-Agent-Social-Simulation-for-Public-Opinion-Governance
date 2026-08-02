@@ -1,0 +1,106 @@
+# config_single.yaml — 单节点冒烟测试
+# 目的：验证 __init__ / _build_social_network / _place_agents / step() 流程能跑通
+# 单节点没有邻居，事件源仍会投放一条 original 消息，用于验证骨架不崩
+
+n_agents: 1
+
+agent_type_ratio:
+  ORDINARY:    1.0
+  ACTIVE:      0.0
+  RATIONAL:    0.0
+  CONTROLLER:  0.0
+
+group_type_ratio:
+  DORM:   0.25
+  CLASS:  0.25
+  MAJOR:  0.25
+  CAMPUS: 0.25
+
+network_type: "barabasi_albert"
+network_params:
+  m: 3
+  group_membership_mode: "hierarchical"
+  forward_destination_strategy: "weighted"
+  cross_group_spread_probability: 0.15
+
+n_steps: 5
+
+hawkes_params:
+  mu:    0.5
+  alpha: 0.3
+  beta:  1.0
+
+# ── 场景仿真参数（逐条对应《场景设定》与流程图）──────────────────────────
+scenario_params:
+
+  # ① 干预触发 ——《场景设定》§3「负面程度超过阈值 → controller 开始干预」
+  intervention_trigger: "negative"   # negative | heat | heat_or_negative | heat_and_negative
+  negative_threshold: 0.65           # 负面程度阈值（触发 Controller 的主条件）
+  heat_threshold: 0.70               # 热度阈值 θ，单列出来，不再和负面阈值混用
+  intervention_requires_controller: true
+  intervention_min_messages: 4       # 群内至少这么多条存活消息才做负面判定，
+                                     # 否则开局第一条 original 就会把整群判成超阈
+
+  # ② 事件发起 —— 流程图「事件源 → 随机发到小群 / 大群」
+  inject_initial_event: true
+  initial_event_group_scope: "small_or_large"  # small | large | small_or_large | any
+                                     # 小群={DORM,CLASS}  大群={MAJOR,CAMPUS}
+  initial_event_heat: 0.80           # H₀
+  initial_event_negative: 0.72
+  initial_event_content: "校园事件相关消息开始在群聊中传播"
+  secondary_event_probability: 0.05  # 每 tick 追加「后续爆料」的概率，0 = 只投一次
+  secondary_event_max: 2
+  secondary_event_min_interval: 8
+
+  # ③ 跨群条件 —— 流程图「转发次数 ≥ 阈 → 进入跨群通道」
+  cross_group_forward_threshold: 2   # 总开关，≤0 表示完全关闭门槛
+  cross_group_forward_threshold_by_direction:
+    upward:   1                      # 小→大：至少被转过 1 次才能往更大的群捅
+    lateral:  0                      # 小群互转：熟人圈层顺手一转，无门槛
+    downward: 3                      # 大→小倒灌最难
+  cross_group_heat_bypass: true      # 源群热度 ≥ θ 时可绕过门槛（对应「热度高→进其他群」）
+  macro_spread_requires_threshold: true
+
+  # ④ 转发方向权重 —— 流程图 DORM–CLASS 横向箭头
+  allow_downward_forward: true
+  forward_direction_weights:
+    upward:   1.00                   # 主通道
+    lateral:  0.55                   # 小群互转（弱）
+    downward: 0.15                   # 大群→小群（最弱）
+  intra_group_forward_weight: 0.60   # 群内转发，是攒够转发次数的唯一途径
+  forward_exposure_weight: 0.50      # 选目标群时曝光的影响力度
+
+  # ⑤ 禁言 / 公告 ——《场景设定》§2 Controller「提醒、澄清、禁言、公告」
+  enable_mute: true
+  mute_duration_ticks: 3             # 实际时长再乘 control_level/2，管理强的群禁得久
+  mute_negative_trigger: 0.68
+  mute_max_per_tick: 2
+  governance_cooldown_ticks: 3       # 同一 Controller 对同一群的治理动作最小间隔
+  announce_negative_relief: 0.18
+  announce_distortion_relief: 0.30
+
+  # ⑥ 曝光 ——《场景设定》§1 群类型表「曝光」列（DORM 低 → CAMPUS 高）
+  exposure_heat_weight: 0.60         # 曝光对热度增益的影响
+  exposure_spread_weight: 1.00       # 曝光对宏观跨群溅射目标选择的影响
+  exposure_perception_weight: 0.60   # 曝光对单 tick 注意力配额的影响
+
+  # 传播失真 / 干预后恢复 ——《场景设定》§3
+  forward_distortion_probability: 0.70
+  forward_distortion_increment_min: 0.03
+  forward_distortion_increment_max: 0.15
+  intervention_negative_decay: 0.75
+  intervention_distortion_decay: 0.80
+
+  # 热度标度（保证 θ=0.7 有阈值语义，H 不会被消息量线性顶穿）
+  base_heat_gain: 0.038
+  heat_cap: 3.0
+  message_expire_ticks: 10
+  negative_smoothing: 0.50
+
+  # 仿真时钟
+  tick_seconds: 3600
+  day_schedule: null   # 使用 types_def.DEFAULT_DAY_SCHEDULE
+
+llm_config: {}
+
+random_seed: null   # null = 每次随机种子

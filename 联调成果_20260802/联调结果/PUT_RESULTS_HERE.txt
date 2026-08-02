@@ -1,0 +1,7 @@
+请把本周联调生成的结果拷进对应子目录：
+
+  mock_100x50/     <- mock 100×50 的 metrics.csv、run_meta.json、figures/
+  bench_V1_10x5/   <- 10×5 DeepSeek 验收结果
+  ds_100x20/       <- 100×20 主跑结果（最重要）
+
+若你本地输出目录名不同，拷贝后请尽量改成上述名字，方便对照 README。

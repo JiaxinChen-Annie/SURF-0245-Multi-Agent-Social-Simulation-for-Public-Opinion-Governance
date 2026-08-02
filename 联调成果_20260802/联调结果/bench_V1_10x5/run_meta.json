@@ -1,0 +1,50 @@
+{
+  "variant": "V1_teacher",
+  "n_agents": 10,
+  "n_steps": 5,
+  "seed": 42,
+  "llm_config": {
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash",
+    "base_url": "https://api.deepseek.com",
+    "timeout": 60,
+    "max_retries": 2,
+    "temperature": 0.2,
+    "thinking": false,
+    "use_actions": true,
+    "fallback_mock": false,
+    "json_mode": true,
+    "max_tokens": 512,
+    "max_prompt_chars": 6000,
+    "max_memory_items": 4,
+    "max_recent_messages": 6,
+    "max_concurrency": 8,
+    "user_id_prefix": "agent",
+    "label": "老师短窗口+JSON（主推候选）"
+  },
+  "init_seconds": 2.8247,
+  "run_seconds": 71.597,
+  "step_seconds_mean": 14.3194,
+  "step_seconds_max": 15.5207,
+  "call_stats": {
+    "n_calls": 38,
+    "n_empty": 0,
+    "n_retry": 0,
+    "n_429": 0,
+    "seconds_total": 71.52533079998102,
+    "prompt_tokens": 83931,
+    "completion_tokens": 4352,
+    "cache_hit_tokens": 11392,
+    "cache_miss_tokens": 72539
+  },
+  "summary_snip": {
+    "cross_group_forward": 30,
+    "cross_group_spread": 0,
+    "mute_count": 0,
+    "announce_count": 0,
+    "message_count_end": 36,
+    "avg_opinion_end": -0.3077377335472684,
+    "negative_emotion_end": 0.8926329564127681,
+    "group_negative_max_peak": 0.8125871993528115
+  }
+}

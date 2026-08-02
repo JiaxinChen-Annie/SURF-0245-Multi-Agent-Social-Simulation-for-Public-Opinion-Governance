@@ -1,0 +1,72 @@
+================================================================================
+先做完这些（在资源管理器里，不用 git）：
+================================================================================
+1) 打开文件夹：
+   E:\SURF\SURF C\联调成果_上传包_20260802
+
+2) 把联调代码整棵复制进：
+   E:\SURF\SURF C\联调成果_上传包_20260802\联调代码\
+
+3) 把运行结果复制进：
+   E:\SURF\SURF C\联调成果_上传包_20260802\联调结果\mock_100x50\
+   E:\SURF\SURF C\联调成果_上传包_20260802\联调结果\bench_V1_10x5\
+   E:\SURF\SURF C\联调成果_上传包_20260802\联调结果\ds_100x20\
+
+4) （可选）删掉 PUT_CODE_HERE.txt / PUT_RESULTS_HERE.txt
+
+5) 确认本机已能访问 GitHub（已登录 gh 或已配好 git credential）
+
+================================================================================
+然后：整段复制下面「从下一行开始到 END」进 Anaconda Prompt 运行
+================================================================================
+
+@@@BEGIN_PASTE@@@
+
+chcp 65001
+conda activate dts209tc
+
+set REPO_URL=https://github.com/JiaxinChen-Annie/SURF-0245-Multi-Agent-Social-Simulation-for-Public-Opinion-Governance.git
+set BRANCH=联调成果
+set WORK=E:\SURF\_gh_surf_joint
+set PACK=E:\SURF\SURF C\联调成果_上传包_20260802
+set DEST_NAME=联调成果_20260802
+
+if exist "%WORK%" rmdir /s /q "%WORK%"
+mkdir "%WORK%"
+cd /d "%WORK%"
+
+git clone "%REPO_URL%" repo
+cd repo
+
+git fetch origin
+git checkout -B "%BRANCH%" origin/%BRANCH% 2>nul || git checkout -B "%BRANCH%"
+
+if exist "%DEST_NAME%" rmdir /s /q "%DEST_NAME%"
+mkdir "%DEST_NAME%"
+xcopy "%PACK%\*" "%CD%\%DEST_NAME%\" /E /I /H /Y
+
+git add "%DEST_NAME%"
+
+git status
+
+git commit -m "联调成果 2026-08-02：ABCDE 合入、LLM 转发修复与 100×20 主跑归档" -m "归档本周联调成果快照（联调代码 + 联调结果）。本周完成：A 治理/转发/时钟合入；B 记忆脑兼容并入；C LLM 预算与 FORWARD 修复；D 评估窗口与切片对齐；E 宽表报表与 fig7/fig8。相对上周，主跑验收通过，跨组转发与通道可观测性显著提升。详见目录内 README.md 与 本周工作纪要.md。"
+
+git push -u origin "%BRANCH%"
+
+echo.
+echo DONE. Open:
+echo https://github.com/JiaxinChen-Annie/SURF-0245-Multi-Agent-Social-Simulation-for-Public-Opinion-Governance/tree/%BRANCH%/%DEST_NAME%
+
+@@@END_PASTE@@@
+
+================================================================================
+说明
+================================================================================
+- 上传标题（commit title）已写在 git commit 第一段 -m
+- 上传描述（commit body）已写在第二段 -m
+- 远程会在分支「联调成果」下新建文件夹「联调成果_20260802」
+- 若 checkout 失败：说明远程还没有该分支名，脚本会本地新建「联调成果」再 push
+- 若 push 要登录：按提示完成 GitHub 登录后，再执行最后两行：
+    git push -u origin 联调成果
+- 若中文分支名报错，可改用（仅当上面失败时）：
+    git push -u origin HEAD:refs/heads/联调成果

@@ -1,0 +1,109 @@
+# 100 agents · 真 DeepSeek · 建议先 20 步（A v3 场景参数）
+#
+# 用法：
+#   set DEEPSEEK_API_KEY=你的key
+#   python run_sim.py --config config_100_ds.yaml
+#
+n_agents: 100
+
+agent_type_ratio:
+  ORDINARY:    0.70
+  ACTIVE:      0.10
+  RATIONAL:    0.10
+  CONTROLLER:  0.10
+
+group_type_ratio:
+  DORM:   0.25
+  CLASS:  0.35
+  MAJOR:  0.25
+  CAMPUS: 0.15
+
+network_type: "barabasi_albert"
+network_params:
+  m: 3
+  group_membership_mode: "hierarchical"
+  forward_destination_strategy: "weighted"
+  cross_group_spread_probability: 0.15
+
+n_steps: 20
+
+hawkes_params:
+  mu:    0.1
+  alpha: 0.5
+  beta:  1.0
+
+scenario_params:
+  intervention_trigger: "negative"
+  negative_threshold: 0.65
+  heat_threshold: 0.70
+  intervention_requires_controller: true
+  intervention_min_messages: 4
+
+  inject_initial_event: true
+  initial_event_group_scope: "small_or_large"
+  initial_event_heat: 0.80
+  initial_event_negative: 0.72
+  initial_event_content: "校园事件相关消息开始在群聊中传播"
+  secondary_event_probability: 0.05
+  secondary_event_max: 2
+  secondary_event_min_interval: 8
+
+  cross_group_forward_threshold: 2
+  cross_group_forward_threshold_by_direction:
+    upward:   1
+    lateral:  0
+    downward: 3
+  cross_group_heat_bypass: true
+  macro_spread_requires_threshold: true
+
+  allow_downward_forward: true
+  forward_direction_weights:
+    upward:   1.00
+    lateral:  0.55
+    downward: 0.15
+  intra_group_forward_weight: 0.60
+  forward_exposure_weight: 0.50
+
+  enable_mute: true
+  mute_duration_ticks: 3
+  mute_negative_trigger: 0.68
+  mute_max_per_tick: 2
+  governance_cooldown_ticks: 3
+  announce_negative_relief: 0.18
+  announce_distortion_relief: 0.30
+
+  exposure_heat_weight: 0.60
+  exposure_spread_weight: 1.00
+  exposure_perception_weight: 0.60
+
+  forward_distortion_probability: 0.70
+  forward_distortion_increment_min: 0.03
+  forward_distortion_increment_max: 0.15
+  intervention_negative_decay: 0.75
+  intervention_distortion_decay: 0.80
+
+  base_heat_gain: 0.038
+  heat_cap: 3.0
+  message_expire_ticks: 10
+  negative_smoothing: 0.50
+
+llm_config:
+  provider: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com
+  timeout: 60
+  max_retries: 2
+  temperature: 0.2
+  thinking: false
+  use_actions: true
+  fallback_mock: true
+  # C：V1 短窗基础上略放宽近期消息，专治 FORWARD=0（仍远小于 1M）
+  json_mode: true
+  max_tokens: 512
+  max_prompt_chars: 6000
+  max_memory_items: 4
+  max_recent_messages: 6
+  max_concurrency: 16
+  user_id_prefix: agent
+
+random_seed: 42
